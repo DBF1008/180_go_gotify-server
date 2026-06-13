@@ -10,6 +10,7 @@ import (
 	"github.com/gotify/server/v2/auth"
 	"github.com/gotify/server/v2/auth/password"
 	"github.com/gotify/server/v2/model"
+	"github.com/rs/zerolog/log"
 )
 
 // The UserDatabase interface for encapsulating database access.
@@ -342,11 +343,21 @@ func (a *UserAPI) DeleteUserByID(ctx *gin.Context) {
 				ctx.AbortWithError(400, errors.New("cannot delete last admin"))
 				return
 			}
-			if err := a.UserChangeNotifier.fireUserDeleted(id); err != nil {
-				ctx.AbortWithError(500, err)
+			// Persist the deletion first so that runtime state is only
+			// mutated when the database operation has fully succeeded.
+			// This prevents a "zombie" user where sessions are killed but
+			// database records still exist.
+			if success := successOrAbort(ctx, 500, a.DB.DeleteUserByID(id)); !success {
 				return
 			}
-			successOrAbort(ctx, 500, a.DB.DeleteUserByID(id))
+			// Now that the database transaction has committed, clean up
+			// runtime resources (WebSocket connections, plugin instances).
+			// A failure here is logged but does not fail the response —
+			// the user is already deleted and stale runtime state will be
+			// cleaned up on the next server restart.
+			if err := a.UserChangeNotifier.fireUserDeleted(id); err != nil {
+				log.Error().Err(err).Uint("user_id", id).Msg("failed to clean up runtime resources after user deletion")
+			}
 		} else {
 			ctx.AbortWithError(404, errors.New("user does not exist"))
 		}

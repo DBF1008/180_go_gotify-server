@@ -1,6 +1,8 @@
 package database
 
 import (
+	"fmt"
+
 	"github.com/gotify/server/v2/model"
 	"gorm.io/gorm"
 )
@@ -51,21 +53,40 @@ func (d *GormDatabase) GetUsers() ([]*model.User, error) {
 	return users, err
 }
 
-// DeleteUserByID deletes a user by its id.
+// DeleteUserByID deletes a user by its id together with all owned data in a
+// single transaction. If any step fails the entire operation is rolled back so
+// that no partial state is left behind.
 func (d *GormDatabase) DeleteUserByID(id uint) error {
-	apps, _ := d.GetApplicationsByUser(id)
-	for _, app := range apps {
-		d.DeleteApplicationByID(app.ID)
-	}
-	clients, _ := d.GetClientsByUser(id)
-	for _, client := range clients {
-		d.DeleteClientByID(client.ID)
-	}
-	pluginConfs, _ := d.GetPluginConfByUser(id)
-	for _, conf := range pluginConfs {
-		d.DeletePluginConfByID(conf.ID)
-	}
-	return d.DB.Where("id = ?", id).Delete(&model.User{}).Error
+	return d.DB.Transaction(func(tx *gorm.DB) error {
+		// 1. Delete all messages belonging to the user's applications.
+		if err := tx.Where(
+			"application_id IN (SELECT id FROM applications WHERE user_id = ?)", id,
+		).Delete(&model.Message{}).Error; err != nil {
+			return fmt.Errorf("delete user %d messages: %w", id, err)
+		}
+
+		// 2. Delete all applications owned by the user.
+		if err := tx.Where("user_id = ?", id).Delete(&model.Application{}).Error; err != nil {
+			return fmt.Errorf("delete user %d applications: %w", id, err)
+		}
+
+		// 3. Delete all clients (including expired ones) for the user.
+		if err := tx.Where("user_id = ?", id).Delete(&model.Client{}).Error; err != nil {
+			return fmt.Errorf("delete user %d clients: %w", id, err)
+		}
+
+		// 4. Delete all plugin configurations for the user.
+		if err := tx.Where("user_id = ?", id).Delete(&model.PluginConf{}).Error; err != nil {
+			return fmt.Errorf("delete user %d plugin configs: %w", id, err)
+		}
+
+		// 5. Finally delete the user record itself.
+		if err := tx.Where("id = ?", id).Delete(&model.User{}).Error; err != nil {
+			return fmt.Errorf("delete user %d: %w", id, err)
+		}
+
+		return nil
+	})
 }
 
 // UpdateUser updates a user.

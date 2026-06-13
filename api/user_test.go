@@ -150,7 +150,7 @@ func (s *UserSuite) Test_DeleteUserByID() {
 	assert.True(s.T(), s.notifiedDelete)
 }
 
-func (s *UserSuite) Test_DeleteUserByID_NotifyFail() {
+func (s *UserSuite) Test_DeleteUserByID_NotifyFail_StillDeletesUser() {
 	s.db.User(5)
 	s.notifier.OnUserDeleted(func(id uint) error {
 		if id == 5 {
@@ -163,7 +163,39 @@ func (s *UserSuite) Test_DeleteUserByID_NotifyFail() {
 
 	s.a.DeleteUserByID(s.ctx)
 
+	// The database deletion succeeded (committed), so the response is 200
+	// even though the post-commit runtime cleanup callback failed.
+	assert.Equal(s.T(), 200, s.recorder.Code)
+	s.db.AssertUserNotExist(5)
+}
+
+// failDeleteDB wraps a real UserDatabase but always fails DeleteUserByID,
+// simulating a cascade-delete failure at the database layer.
+type failDeleteDB struct {
+	UserDatabase
+}
+
+func (f *failDeleteDB) DeleteUserByID(id uint) error {
+	return errors.New("simulated cascade delete failure")
+}
+
+func (s *UserSuite) Test_DeleteUserByID_DBFail_NoNotification() {
+	s.db.User(5)
+	s.notifiedDelete = false
+
+	failDB := &failDeleteDB{s.db}
+	apiWithFailDB := &UserAPI{DB: failDB, UserChangeNotifier: s.notifier}
+
+	s.ctx.Params = gin.Params{{Key: "id", Value: "5"}}
+
+	apiWithFailDB.DeleteUserByID(s.ctx)
+
+	// The database deletion failed, so the response is 500.
 	assert.Equal(s.T(), 500, s.recorder.Code)
+	// Runtime cleanup callbacks must NOT have been fired.
+	assert.False(s.T(), s.notifiedDelete)
+	// The user must still exist in the database.
+	s.db.AssertUserExist(5)
 }
 
 func (s *UserSuite) Test_CreateUser() {
