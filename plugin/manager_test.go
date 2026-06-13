@@ -317,6 +317,23 @@ func (s *ManagerSuite) TestRemoveUser_danglingConf_expectSuccess() {
 	assert.Nil(s.T(), s.manager.RemoveUser(9))
 }
 
+// RemoveUser must unload a user's plugin instances purely from memory, so cleanup
+// still works after the user (and its plugin configurations) has already been
+// deleted from the database — the ordering the user-deletion handler now uses.
+func (s *ManagerSuite) TestRemoveUser_afterConfDeleted_stillUnloads() {
+	s.db.User(11)
+	assert.Nil(s.T(), s.manager.InitializeForUserID(11))
+	pid := s.getConfForExamplePlugin(11).ID
+	assert.True(s.T(), s.manager.HasInstance(pid))
+
+	// Mirror the production flow: the user and its plugin confs are deleted from
+	// the database first, then runtime cleanup runs.
+	assert.NoError(s.T(), s.db.DeleteUserByID(11))
+
+	assert.Nil(s.T(), s.manager.RemoveUser(11))
+	assert.False(s.T(), s.manager.HasInstance(pid), "instance must be unloaded even though its conf is gone from the db")
+}
+
 func (s *ManagerSuite) TestTriggerMessage() {
 	inst := s.getMockPluginInstance(1)
 	inst.TriggerMessage()

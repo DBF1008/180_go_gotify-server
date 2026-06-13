@@ -51,17 +51,23 @@ type Manager struct {
 	messages  chan MessageWithUserID
 	db        Database
 	mux       *gin.RouterGroup
+	// userInstances maps a user id to the plugin configuration ids of its loaded
+	// instances and whether each one is currently enabled. It mirrors instances
+	// so a user's plugins can be unloaded purely from memory, even after the
+	// user (and its plugin configurations) have been deleted from the database.
+	userInstances map[uint]map[uint]bool
 }
 
 // NewManager created a Manager from configurations.
 func NewManager(db Database, directory string, mux *gin.RouterGroup, notifier Notifier) (*Manager, error) {
 	manager := &Manager{
-		mutex:     &sync.RWMutex{},
-		instances: map[uint]compat.PluginInstance{},
-		plugins:   map[string]compat.Plugin{},
-		messages:  make(chan MessageWithUserID),
-		db:        db,
-		mux:       mux,
+		mutex:         &sync.RWMutex{},
+		instances:     map[uint]compat.PluginInstance{},
+		plugins:       map[string]compat.Plugin{},
+		messages:      make(chan MessageWithUserID),
+		db:            db,
+		mux:           mux,
+		userInstances: map[uint]map[uint]bool{},
 	}
 
 	go func() {
@@ -144,6 +150,7 @@ func (m *Manager) SetPluginEnabled(pluginID uint, enabled bool) error {
 		conf = newConf
 	}
 	conf.Enabled = enabled
+	m.trackUserInstance(conf.UserID, pluginID, enabled)
 	return m.db.UpdatePluginConf(conf)
 }
 
@@ -180,30 +187,40 @@ func (m *Manager) HasInstance(pluginID uint) bool {
 	return err == nil && instance != nil
 }
 
-// RemoveUser disabled all plugins of a user when the user is disabled.
-func (m *Manager) RemoveUser(userID uint) error {
-	for _, p := range m.plugins {
-		pluginConf, err := m.db.GetPluginConfByUserAndPath(userID, p.PluginInfo().ModulePath)
-		if err != nil {
-			return err
-		}
-		if pluginConf == nil {
-			continue
-		}
-		if pluginConf.Enabled {
-			inst, err := m.Instance(pluginConf.ID)
-			if err != nil {
-				continue
-			}
-			m.mutex.Lock()
-			err = inst.Disable()
-			m.mutex.Unlock()
-			if err != nil {
-				return err
-			}
-		}
-		delete(m.instances, pluginConf.ID)
+// trackUserInstance records that the plugin configuration confID of user userID
+// has a loaded instance and whether it is currently enabled. Callers must hold
+// m.mutex (or run before the manager is used concurrently, as during startup).
+func (m *Manager) trackUserInstance(userID, confID uint, enabled bool) {
+	if m.userInstances[userID] == nil {
+		m.userInstances[userID] = map[uint]bool{}
 	}
+	m.userInstances[userID][confID] = enabled
+}
+
+// RemoveUser unloads all plugin instances of a user: it disables every enabled
+// instance and drops it from the manager.
+//
+// Cleanup relies solely on the in-memory index, so it stays correct even when
+// the user (and its plugin configurations) has already been removed from the
+// database. If disabling an instance fails the instance is kept and the error is
+// returned, so the caller can retry.
+func (m *Manager) RemoveUser(userID uint) error {
+	m.mutex.Lock()
+	defer m.mutex.Unlock()
+
+	confs := m.userInstances[userID]
+	for confID, enabled := range confs {
+		if enabled {
+			if inst, ok := m.instances[confID]; ok {
+				if err := inst.Disable(); err != nil {
+					return err
+				}
+			}
+		}
+		delete(m.instances, confID)
+		delete(confs, confID)
+	}
+	delete(m.userInstances, userID)
 	return nil
 }
 
@@ -360,6 +377,7 @@ func (m *Manager) initializeSingleUserPlugin(userCtx compat.UserContext, p compa
 			m.db.UpdatePluginConf(pluginConf)
 		}
 	}
+	m.trackUserInstance(pluginConf.UserID, pluginConf.ID, pluginConf.Enabled)
 	return nil
 }
 

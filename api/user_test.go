@@ -40,6 +40,8 @@ func (s *UserSuite) BeforeTest(suiteName, testName string) {
 	s.db = testdb.NewDB(s.T())
 
 	s.notifier = new(UserChangeNotifier)
+	s.notifiedAdd = false
+	s.notifiedDelete = false
 	s.notifier.OnUserDeleted(func(uint) error {
 		s.notifiedDelete = true
 		return nil
@@ -116,6 +118,9 @@ func (s *UserSuite) Test_DeleteUserByID_LastAdmin_Expect400() {
 	s.a.DeleteUserByID(s.ctx)
 
 	assert.Equal(s.T(), 400, s.recorder.Code)
+	// The protected admin must survive and no runtime teardown may run.
+	s.db.AssertUserExist(7)
+	assert.False(s.T(), s.notifiedDelete)
 }
 
 func (s *UserSuite) Test_DeleteUserByID_InvalidID() {
@@ -150,7 +155,10 @@ func (s *UserSuite) Test_DeleteUserByID() {
 	assert.True(s.T(), s.notifiedDelete)
 }
 
-func (s *UserSuite) Test_DeleteUserByID_NotifyFail() {
+// A runtime cleanup callback failing after the user has been durably deleted is
+// best-effort: the user is already gone (the source of truth), so the request
+// still succeeds instead of reporting a misleading failure.
+func (s *UserSuite) Test_DeleteUserByID_RuntimeCleanupFail_StillDeleted() {
 	s.db.User(5)
 	s.notifier.OnUserDeleted(func(id uint) error {
 		if id == 5 {
@@ -163,7 +171,24 @@ func (s *UserSuite) Test_DeleteUserByID_NotifyFail() {
 
 	s.a.DeleteUserByID(s.ctx)
 
+	assert.Equal(s.T(), 200, s.recorder.Code)
+	s.db.AssertUserNotExist(5)
+}
+
+// If persisting the deletion (the transactional cascade) fails, the request must
+// fail and no runtime cleanup may run: the user is left fully intact rather than
+// half-deleted with its sessions kicked or plugins unloaded.
+func (s *UserSuite) Test_DeleteUserByID_CascadeDeleteFails_NothingTornDown() {
+	s.db.User(2)
+	s.a.DB = &failingDeleteUserDB{UserDatabase: s.db, err: errors.New("cascade delete failed")}
+
+	s.ctx.Params = gin.Params{{Key: "id", Value: "2"}}
+
+	s.a.DeleteUserByID(s.ctx)
+
 	assert.Equal(s.T(), 500, s.recorder.Code)
+	assert.False(s.T(), s.notifiedDelete, "runtime cleanup must not run when the persistent delete fails")
+	s.db.AssertUserExist(2)
 }
 
 func (s *UserSuite) Test_CreateUser() {
@@ -440,4 +465,16 @@ func (s *UserSuite) noLogin() {
 
 func externalOf(user *model.User) *model.UserExternal {
 	return &model.UserExternal{Name: user.Name, Admin: user.Admin, ID: user.ID, CreatedAt: user.CreatedAt}
+}
+
+// failingDeleteUserDB wraps a UserDatabase and forces DeleteUserByID to fail, to
+// simulate a cascade/persistence failure while keeping every other operation
+// (lookups, counts) backed by the real database.
+type failingDeleteUserDB struct {
+	UserDatabase
+	err error
+}
+
+func (f *failingDeleteUserDB) DeleteUserByID(uint) error {
+	return f.err
 }

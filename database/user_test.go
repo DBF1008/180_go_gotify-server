@@ -180,3 +180,32 @@ func (s *DatabaseSuite) TestDeleteUserDeletesApplicationsAndClientsAndPluginConf
 	require.NoError(s.T(), err)
 	assert.NotNil(s.T(), msg)
 }
+
+// A failure partway through the cascade must roll the whole deletion back, so the
+// user is never left half-deleted with orphaned resources.
+func (s *DatabaseSuite) TestDeleteUserByID_CascadeFailure_RollsBack() {
+	require.NoError(s.T(), s.db.CreateUser(&model.User{Name: "casc", ID: 30}))
+	require.NoError(s.T(), s.db.CreateApplication(&model.Application{ID: 300, Token: "apptoken30", UserID: 30}))
+	require.NoError(s.T(), s.db.CreateMessage(&model.Message{ID: 3000, ApplicationID: 300}))
+	require.NoError(s.T(), s.db.CreateClient(&model.Client{ID: 30000, Token: "clienttoken30", UserID: 30}))
+
+	// Drop the clients table so the client-deletion step of the cascade fails
+	// after the messages and applications have already been deleted in the
+	// transaction.
+	require.NoError(s.T(), s.db.DB.Migrator().DropTable(&model.Client{}))
+
+	require.Error(s.T(), s.db.DeleteUserByID(30))
+
+	// Nothing must have been deleted: the earlier steps rolled back.
+	user, err := s.db.GetUserByID(30)
+	require.NoError(s.T(), err)
+	assert.NotNil(s.T(), user, "user must survive a rolled-back delete")
+
+	app, err := s.db.GetApplicationByID(300)
+	require.NoError(s.T(), err)
+	assert.NotNil(s.T(), app, "application must survive a rolled-back delete")
+
+	msg, err := s.db.GetMessageByID(3000)
+	require.NoError(s.T(), err)
+	assert.NotNil(s.T(), msg, "message must survive a rolled-back delete")
+}

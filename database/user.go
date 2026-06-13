@@ -51,21 +51,34 @@ func (d *GormDatabase) GetUsers() ([]*model.User, error) {
 	return users, err
 }
 
-// DeleteUserByID deletes a user by its id.
+// DeleteUserByID deletes a user and all the resources owned by it: applications
+// (and their messages), clients and plugin configurations.
+//
+// The whole cascade runs inside a single transaction, so a failure in any step
+// rolls the others back. This guarantees the user is either fully deleted or
+// left completely intact and never half-deleted with orphaned resources.
 func (d *GormDatabase) DeleteUserByID(id uint) error {
-	apps, _ := d.GetApplicationsByUser(id)
-	for _, app := range apps {
-		d.DeleteApplicationByID(app.ID)
-	}
-	clients, _ := d.GetClientsByUser(id)
-	for _, client := range clients {
-		d.DeleteClientByID(client.ID)
-	}
-	pluginConfs, _ := d.GetPluginConfByUser(id)
-	for _, conf := range pluginConfs {
-		d.DeletePluginConfByID(conf.ID)
-	}
-	return d.DB.Where("id = ?", id).Delete(&model.User{}).Error
+	return d.DB.Transaction(func(tx *gorm.DB) error {
+		var appIDs []uint
+		if err := tx.Model(&model.Application{}).Where("user_id = ?", id).Pluck("id", &appIDs).Error; err != nil {
+			return err
+		}
+		if len(appIDs) > 0 {
+			if err := tx.Where("application_id IN ?", appIDs).Delete(&model.Message{}).Error; err != nil {
+				return err
+			}
+		}
+		if err := tx.Where("user_id = ?", id).Delete(&model.Application{}).Error; err != nil {
+			return err
+		}
+		if err := tx.Where("user_id = ?", id).Delete(&model.Client{}).Error; err != nil {
+			return err
+		}
+		if err := tx.Where("user_id = ?", id).Delete(&model.PluginConf{}).Error; err != nil {
+			return err
+		}
+		return tx.Where("id = ?", id).Delete(&model.User{}).Error
+	})
 }
 
 // UpdateUser updates a user.

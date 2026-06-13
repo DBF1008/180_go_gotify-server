@@ -342,11 +342,18 @@ func (a *UserAPI) DeleteUserByID(ctx *gin.Context) {
 				ctx.AbortWithError(400, errors.New("cannot delete last admin"))
 				return
 			}
-			if err := a.UserChangeNotifier.fireUserDeleted(id); err != nil {
-				ctx.AbortWithError(500, err)
+			// Persist the deletion first. The cascade is transactional, so on
+			// failure nothing is removed and we abort before touching any runtime
+			// state, leaving the user fully intact instead of half-deleted.
+			if success := successOrAbort(ctx, 500, a.DB.DeleteUserByID(id)); !success {
 				return
 			}
-			successOrAbort(ctx, 500, a.DB.DeleteUserByID(id))
+			// The user is now durably gone (the source of truth), so runtime
+			// cleanup (kicking sessions, unloading plugins) is best-effort:
+			// record any failure for the access log but still report success.
+			if err := a.UserChangeNotifier.fireUserDeleted(id); err != nil {
+				ctx.Error(err)
+			}
 		} else {
 			ctx.AbortWithError(404, errors.New("user does not exist"))
 		}
