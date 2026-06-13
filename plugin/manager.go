@@ -50,6 +50,7 @@ type Manager struct {
 	plugins   map[string]compat.Plugin
 	messages  chan MessageWithUserID
 	db        Database
+	notifier  Notifier
 	mux       *gin.RouterGroup
 }
 
@@ -61,27 +62,11 @@ func NewManager(db Database, directory string, mux *gin.RouterGroup, notifier No
 		plugins:   map[string]compat.Plugin{},
 		messages:  make(chan MessageWithUserID),
 		db:        db,
+		notifier:  notifier,
 		mux:       mux,
 	}
 
-	go func() {
-		for {
-			message := <-manager.messages
-			internalMsg := &model.Message{
-				ApplicationID: message.Message.ApplicationID,
-				Title:         message.Message.Title,
-				Priority:      *message.Message.Priority,
-				Date:          message.Message.Date,
-				Message:       message.Message.Message,
-			}
-			if message.Message.Extras != nil {
-				internalMsg.Extras, _ = json.Marshal(message.Message.Extras)
-			}
-			db.CreateMessage(internalMsg)
-			message.Message.ID = internalMsg.ID
-			notifier.Notify(message.UserID, &message.Message)
-		}
-	}()
+	go manager.processMessages()
 
 	if err := manager.loadPlugins(directory); err != nil {
 		return nil, err
@@ -98,6 +83,47 @@ func NewManager(db Database, directory string, mux *gin.RouterGroup, notifier No
 	}
 
 	return manager, nil
+}
+
+// processMessages consumes plugin messages one at a time and dispatches each of
+// them through processMessage. Handling them serially keeps the order in which
+// messages are broadcast consistent with the order in which they are persisted
+// (and therefore with their database IDs).
+func (m *Manager) processMessages() {
+	for message := range m.messages {
+		m.processMessage(message)
+	}
+}
+
+// processMessage persists a single plugin message and, only when the write
+// succeeds, broadcasts it to the recipient. The persistence outcome is reported
+// back through message.result so the originating plugin's SendMessage call
+// receives a clear success or failure signal. The notification is sent after
+// the result has been reported so that a slow client cannot block the plugin,
+// while still guaranteeing that a message is broadcast if and only if it was
+// persisted.
+func (m *Manager) processMessage(message MessageWithUserID) {
+	internalMsg := &model.Message{
+		ApplicationID: message.Message.ApplicationID,
+		Title:         message.Message.Title,
+		Priority:      *message.Message.Priority,
+		Date:          message.Message.Date,
+		Message:       message.Message.Message,
+	}
+	if message.Message.Extras != nil {
+		internalMsg.Extras, _ = json.Marshal(message.Message.Extras)
+	}
+
+	err := m.db.CreateMessage(internalMsg)
+	if message.result != nil {
+		message.result <- err
+	}
+	if err != nil {
+		return
+	}
+
+	message.Message.ID = internalMsg.ID
+	m.notifier.Notify(message.UserID, &message.Message)
 }
 
 // ErrAlreadyEnabledOrDisabled is returned on SetPluginEnabled call when a plugin is already enabled or disabled.

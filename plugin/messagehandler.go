@@ -17,10 +17,20 @@ type redirectToChannel struct {
 type MessageWithUserID struct {
 	Message model.MessageExternal
 	UserID  uint
+	// result reports the persistence outcome back to the sender of the message.
+	// It is set by SendMessage; it is nil for messages that are not awaiting a
+	// delivery result (for example notifications forwarded in tests).
+	result chan error
 }
 
-// SendMessage sends a message to the underlying message channel.
+// SendMessage persists and broadcasts a message through the manager's delivery
+// loop. It blocks until the message has been written to the database and
+// returns any persistence error, so the plugin receives a clear failure signal
+// when the underlying storage rejects the message. The message is broadcast to
+// clients only if it was persisted successfully, keeping the real-time
+// notification consistent with what is later returned from the message history.
 func (c redirectToChannel) SendMessage(msg compat.Message) error {
+	result := make(chan error, 1)
 	c.Messages <- MessageWithUserID{
 		Message: model.MessageExternal{
 			ApplicationID: c.ApplicationID,
@@ -31,6 +41,7 @@ func (c redirectToChannel) SendMessage(msg compat.Message) error {
 			Extras:        msg.Extras,
 		},
 		UserID: c.UserID,
+		result: result,
 	}
-	return nil
+	return <-result
 }
