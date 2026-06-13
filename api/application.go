@@ -277,6 +277,71 @@ func (a *ApplicationAPI) UpdateApplication(ctx *gin.Context) {
 	})
 }
 
+// RotateApplicationToken generates a new token for an application, invalidating the old one.
+// swagger:operation POST /application/{id}/token application rotateApplicationToken
+//
+// Rotate an application token.
+//
+// Generates a new token for the application and invalidates the old one. Everything else
+// about the application (name, description, image, default priority, sort order and the
+// message history) is kept.
+//
+// Requires elevated authentication.
+//
+//	---
+//	consumes: [application/json]
+//	produces: [application/json]
+//	parameters:
+//	- name: id
+//	  in: path
+//	  description: the application id
+//	  required: true
+//	  type: integer
+//	  format: int64
+//	security: [clientTokenAuthorizationHeader: [], clientTokenHeader: [], clientTokenQuery: [], basicAuth: []]
+//	responses:
+//	  200:
+//	    description: Ok
+//	    schema:
+//	        $ref: "#/definitions/Application"
+//	  400:
+//	    description: Bad Request
+//	    schema:
+//	        $ref: "#/definitions/Error"
+//	  401:
+//	    description: Unauthorized
+//	    schema:
+//	        $ref: "#/definitions/Error"
+//	  403:
+//	    description: Forbidden
+//	    schema:
+//	        $ref: "#/definitions/Error"
+//	  404:
+//	    description: Not Found
+//	    schema:
+//	        $ref: "#/definitions/Error"
+func (a *ApplicationAPI) RotateApplicationToken(ctx *gin.Context) {
+	withID(ctx, "id", func(id uint) {
+		app, err := a.DB.GetApplicationByID(id)
+		if success := successOrAbort(ctx, 500, err); !success {
+			return
+		}
+		if app != nil && app.UserID == auth.GetUserID(ctx) {
+			if app.Internal {
+				ctx.AbortWithError(400, errors.New("cannot rotate token of internal application"))
+				return
+			}
+			app.Token = auth.GenerateNotExistingToken(generateApplicationToken, a.applicationExists)
+			if success := successOrAbort(ctx, 500, a.DB.UpdateApplication(app)); !success {
+				return
+			}
+			ctx.JSON(200, withResolvedImage(app))
+		} else {
+			ctx.AbortWithError(404, fmt.Errorf("app with id %d doesn't exists", id))
+		}
+	})
+}
+
 // UploadApplicationImage uploads an image for an application.
 // swagger:operation POST /application/{id}/image application uploadAppImage
 //

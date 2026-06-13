@@ -667,6 +667,109 @@ func (s *ApplicationSuite) Test_UpdateApplication_duplicateSortKey() {
 	assert.Equal(s.T(), 400, s.recorder.Code)
 }
 
+func (s *ApplicationSuite) Test_RotateApplicationToken_expectSuccess() {
+	s.db.User(5).AppWithToken(7, firstApplicationToken).Message(1).Message(2)
+	app, err := s.db.GetApplicationByID(7)
+	require.NoError(s.T(), err)
+	app.Name = "backup"
+	app.Description = "nightly backups"
+	app.DefaultPriority = 7
+	app.SortKey = "a5"
+	app.Image = "existing.png"
+	require.NoError(s.T(), s.db.UpdateApplication(app))
+
+	test.WithUser(s.ctx, 5)
+	s.ctx.Request = httptest.NewRequest("POST", "/application/7/token", nil)
+	s.ctx.AddParam("id", "7")
+
+	s.a.RotateApplicationToken(s.ctx)
+
+	assert.Equal(s.T(), 200, s.recorder.Code)
+
+	// The response carries the new token (and the resolved image url).
+	expected := &model.Application{
+		ID:              7,
+		Token:           secondApplicationToken,
+		UserID:          5,
+		Name:            "backup",
+		Description:     "nightly backups",
+		DefaultPriority: 7,
+		SortKey:         "a5",
+		Image:           "image/existing.png",
+		CreatedAt:       testdb.Now,
+	}
+	test.BodyEquals(s.T(), expected, s.recorder)
+
+	// Only the token changed in the DB; all other configuration is preserved.
+	if got, err := s.db.GetApplicationByID(7); assert.NoError(s.T(), err) {
+		assert.Equal(s.T(), secondApplicationToken, got.Token)
+		assert.Equal(s.T(), "backup", got.Name)
+		assert.Equal(s.T(), "nightly backups", got.Description)
+		assert.Equal(s.T(), 7, got.DefaultPriority)
+		assert.Equal(s.T(), "a5", got.SortKey)
+		assert.Equal(s.T(), "existing.png", got.Image)
+		assert.Equal(s.T(), uint(5), got.UserID)
+		assert.Equal(s.T(), testdb.Now, got.CreatedAt)
+	}
+
+	// The message history survives the rotation.
+	s.db.AssertMessageExist(1)
+	s.db.AssertMessageExist(2)
+
+	// The old token is dead, the new token resolves.
+	if old, err := s.db.GetApplicationByToken(firstApplicationToken); assert.NoError(s.T(), err) {
+		assert.Nil(s.T(), old)
+	}
+	if fresh, err := s.db.GetApplicationByToken(secondApplicationToken); assert.NoError(s.T(), err) {
+		assert.NotNil(s.T(), fresh)
+	}
+}
+
+func (s *ApplicationSuite) Test_RotateApplicationToken_internal_expectBadRequest() {
+	s.db.User(5).InternalApp(10)
+
+	test.WithUser(s.ctx, 5)
+	s.ctx.Request = httptest.NewRequest("POST", "/application/10/token", nil)
+	s.ctx.AddParam("id", "10")
+
+	s.a.RotateApplicationToken(s.ctx)
+
+	assert.Equal(s.T(), 400, s.recorder.Code)
+	// An internal application's token must be untouched.
+	if app, err := s.db.GetApplicationByID(10); assert.NoError(s.T(), err) {
+		assert.Equal(s.T(), "app10", app.Token)
+	}
+}
+
+func (s *ApplicationSuite) Test_RotateApplicationToken_expectNotFound() {
+	s.db.User(5)
+
+	test.WithUser(s.ctx, 5)
+	s.ctx.Request = httptest.NewRequest("POST", "/application/4/token", nil)
+	s.ctx.AddParam("id", "4")
+
+	s.a.RotateApplicationToken(s.ctx)
+
+	assert.Equal(s.T(), 404, s.recorder.Code)
+}
+
+func (s *ApplicationSuite) Test_RotateApplicationToken_expectNotFoundOnCurrentUserIsNotOwner() {
+	s.db.User(2)
+	s.db.User(5).NewAppWithToken(7, firstApplicationToken)
+
+	test.WithUser(s.ctx, 2)
+	s.ctx.Request = httptest.NewRequest("POST", "/application/7/token", nil)
+	s.ctx.AddParam("id", "7")
+
+	s.a.RotateApplicationToken(s.ctx)
+
+	assert.Equal(s.T(), 404, s.recorder.Code)
+	// The token of an application owned by someone else must be untouched.
+	if app, err := s.db.GetApplicationByID(7); assert.NoError(s.T(), err) {
+		assert.Equal(s.T(), firstApplicationToken, app.Token)
+	}
+}
+
 func (s *ApplicationSuite) withFormData(formData string) {
 	s.ctx.Request = httptest.NewRequest("POST", "/token", strings.NewReader(formData))
 	s.ctx.Request.Header.Set("Content-Type", "application/x-www-form-urlencoded")

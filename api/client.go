@@ -322,6 +322,72 @@ func (a *ClientAPI) ElevateClient(ctx *gin.Context) {
 	})
 }
 
+// RotateClientToken generates a new token for a client, invalidating the old one.
+// swagger:operation POST /client/{id}/token client rotateClientToken
+//
+// Rotate a client token.
+//
+// Generates a new token for the client and invalidates the old one. The client keeps its
+// name and settings, and any active stream connection still using the old token is closed.
+//
+// Requires elevated authentication.
+//
+//	---
+//	consumes: [application/json]
+//	produces: [application/json]
+//	parameters:
+//	- name: id
+//	  in: path
+//	  description: the client id
+//	  required: true
+//	  type: integer
+//	  format: int64
+//	security: [clientTokenAuthorizationHeader: [], clientTokenHeader: [], clientTokenQuery: [], basicAuth: []]
+//	responses:
+//	  200:
+//	    description: Ok
+//	    schema:
+//	        $ref: "#/definitions/Client"
+//	  400:
+//	    description: Bad Request
+//	    schema:
+//	        $ref: "#/definitions/Error"
+//	  401:
+//	    description: Unauthorized
+//	    schema:
+//	        $ref: "#/definitions/Error"
+//	  403:
+//	    description: Forbidden
+//	    schema:
+//	        $ref: "#/definitions/Error"
+//	  404:
+//	    description: Not Found
+//	    schema:
+//	        $ref: "#/definitions/Error"
+func (a *ClientAPI) RotateClientToken(ctx *gin.Context) {
+	withID(ctx, "id", func(id uint) {
+		client, err := a.DB.GetClientByID(id)
+		if success := successOrAbort(ctx, 500, err); !success {
+			return
+		}
+		if client == nil || client.UserID != auth.GetUserID(ctx) {
+			ctx.AbortWithError(404, fmt.Errorf("client with id %d doesn't exists", id))
+			return
+		}
+
+		oldToken := client.Token
+		client.Token = auth.GenerateNotExistingToken(generateClientToken, a.clientExists)
+		if success := successOrAbort(ctx, 500, a.DB.UpdateClient(client)); !success {
+			return
+		}
+		// Persist the new token before dropping the old connection: this way a reconnect
+		// can never re-authenticate with the (now invalid) old token.
+		a.NotifyDeleted(client.UserID, oldToken)
+
+		ctx.JSON(200, client)
+	})
+}
+
 func (a *ClientAPI) clientExists(token string) bool {
 	client, _ := a.DB.GetClientByToken(token)
 	return client != nil

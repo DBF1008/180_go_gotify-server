@@ -401,6 +401,88 @@ func (s *IntegrationSuite) TestAuthentication() {
 	assert.Equal(s.T(), "android-client", token.Name)
 }
 
+// TestRotateTokenInvalidatesOldToken drives the rotation endpoints through the full router
+// (real auth middleware + stream handler) and verifies the old token stops working while the
+// new one takes over, for both applications and clients.
+func (s *IntegrationSuite) TestRotateTokenInvalidatesOldToken() {
+	// --- application token rotation ---
+	req := s.newRequest("POST", "application", `{"name": "backup-server"}`)
+	req.SetBasicAuth("admin", "pw")
+	res, err := client.Do(req)
+	assert.Nil(s.T(), err)
+	assert.Equal(s.T(), 200, res.StatusCode)
+	app := &model.Application{}
+	json.NewDecoder(res.Body).Decode(app)
+	oldAppToken := app.Token
+
+	// the original app token can send a message
+	doRequestAndExpectStatus(s.T(), s.appMessage(oldAppToken), 200)
+
+	// rotate the application token (basic auth satisfies the elevated requirement)
+	req = s.newRequest("POST", fmt.Sprintf("application/%d/token", app.ID), "")
+	req.SetBasicAuth("admin", "pw")
+	res, err = client.Do(req)
+	assert.Nil(s.T(), err)
+	assert.Equal(s.T(), 200, res.StatusCode)
+	rotatedApp := &model.Application{}
+	json.NewDecoder(res.Body).Decode(rotatedApp)
+	assert.Equal(s.T(), "backup-server", rotatedApp.Name) // configuration preserved
+	assert.NotEmpty(s.T(), rotatedApp.Token)
+	assert.NotEqual(s.T(), oldAppToken, rotatedApp.Token) // a new token was issued
+
+	// the old app token is now rejected, the new one works
+	doRequestAndExpectStatus(s.T(), s.appMessage(oldAppToken), 401)
+	doRequestAndExpectStatus(s.T(), s.appMessage(rotatedApp.Token), 200)
+
+	// --- client token rotation ---
+	req = s.newRequest("POST", "client", `{"name": "phone"}`)
+	req.SetBasicAuth("admin", "pw")
+	res, err = client.Do(req)
+	assert.Nil(s.T(), err)
+	assert.Equal(s.T(), 200, res.StatusCode)
+	cl := &model.Client{}
+	json.NewDecoder(res.Body).Decode(cl)
+	oldClientToken := cl.Token
+
+	// the original client token authenticates
+	doRequestAndExpectStatus(s.T(), s.currentUser(oldClientToken), 200)
+
+	// rotate the client token
+	req = s.newRequest("POST", fmt.Sprintf("client/%d/token", cl.ID), "")
+	req.SetBasicAuth("admin", "pw")
+	res, err = client.Do(req)
+	assert.Nil(s.T(), err)
+	assert.Equal(s.T(), 200, res.StatusCode)
+	rotatedClient := &model.Client{}
+	json.NewDecoder(res.Body).Decode(rotatedClient)
+	assert.Equal(s.T(), "phone", rotatedClient.Name) // configuration preserved
+	assert.NotEmpty(s.T(), rotatedClient.Token)
+	assert.NotEqual(s.T(), oldClientToken, rotatedClient.Token)
+
+	// the old client token is now rejected, the new one works
+	doRequestAndExpectStatus(s.T(), s.currentUser(oldClientToken), 401)
+	doRequestAndExpectStatus(s.T(), s.currentUser(rotatedClient.Token), 200)
+}
+
+func (s *IntegrationSuite) appMessage(token string) *http.Request {
+	req := s.newRequest("POST", "message", `{"message": "hi", "title": "t"}`)
+	req.Header.Add("X-Gotify-Key", token)
+	return req
+}
+
+func (s *IntegrationSuite) currentUser(token string) *http.Request {
+	req := s.newRequest("GET", "current/user", "")
+	req.Header.Add("X-Gotify-Key", token)
+	return req
+}
+
+func doRequestAndExpectStatus(t *testing.T, req *http.Request, code int) {
+	res, err := client.Do(req)
+	assert.Nil(t, err)
+	assert.Equal(t, code, res.StatusCode)
+	res.Body.Close()
+}
+
 func (s *IntegrationSuite) newRequest(method, url, body string) *http.Request {
 	req, err := http.NewRequest(method, fmt.Sprintf("%s/%s", s.server.URL, url), strings.NewReader(body))
 	req.Header.Add("Content-Type", "application/json")

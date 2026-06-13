@@ -28,11 +28,13 @@ func TestClientSuite(t *testing.T) {
 
 type ClientSuite struct {
 	suite.Suite
-	db       *testdb.Database
-	a        *ClientAPI
-	ctx      *gin.Context
-	recorder *httptest.ResponseRecorder
-	notified bool
+	db             *testdb.Database
+	a              *ClientAPI
+	ctx            *gin.Context
+	recorder       *httptest.ResponseRecorder
+	notified       bool
+	notifiedUserID uint
+	notifiedToken  string
 }
 
 var originalGenerateClientToken func() string
@@ -46,11 +48,15 @@ func (s *ClientSuite) BeforeTest(suiteName, testName string) {
 	s.ctx, _ = gin.CreateTestContext(s.recorder)
 	withURL(s.ctx, "http", "example.com")
 	s.notified = false
+	s.notifiedUserID = 0
+	s.notifiedToken = ""
 	s.a = &ClientAPI{DB: s.db, NotifyDeleted: s.notify}
 }
 
-func (s *ClientSuite) notify(uint, string) {
+func (s *ClientSuite) notify(userID uint, token string) {
 	s.notified = true
+	s.notifiedUserID = userID
+	s.notifiedToken = token
 }
 
 func (s *ClientSuite) AfterTest(suiteName, testName string) {
@@ -321,6 +327,78 @@ func (s *ClientSuite) Test_ElevateClient_expectBadRequestOnMissingDuration() {
 	client, err := s.db.GetClientByID(8)
 	assert.NoError(s.T(), err)
 	assert.Nil(s.T(), client.ElevatedUntil)
+}
+
+func (s *ClientSuite) Test_RotateClientToken_expectSuccess() {
+	s.db.User(5)
+	s.db.CreateClient(&model.Client{ID: 8, UserID: 5, Token: firstClientToken, Name: "android", ExpiresAfterInactivitySeconds: 3600})
+
+	test.WithUser(s.ctx, 5)
+	s.ctx.Request = httptest.NewRequest("POST", "/client/8/token", nil)
+	s.ctx.AddParam("id", "8")
+
+	s.a.RotateClientToken(s.ctx)
+
+	assert.Equal(s.T(), 200, s.recorder.Code)
+
+	// The response carries the new token; every other field is preserved.
+	expected := &model.Client{
+		ID:                            8,
+		UserID:                        5,
+		Token:                         secondClientToken,
+		Name:                          "android",
+		CreatedAt:                     testdb.Now,
+		ExpiresAfterInactivitySeconds: 3600,
+	}
+	expected.PopulateExpiresAt()
+	test.BodyEquals(s.T(), expected, s.recorder)
+	if client, err := s.db.GetClientByID(8); assert.NoError(s.T(), err) {
+		assert.Equal(s.T(), expected, client)
+	}
+
+	// The old token is dead, the new token resolves.
+	if old, err := s.db.GetClientByToken(firstClientToken); assert.NoError(s.T(), err) {
+		assert.Nil(s.T(), old)
+	}
+	if fresh, err := s.db.GetClientByToken(secondClientToken); assert.NoError(s.T(), err) {
+		assert.NotNil(s.T(), fresh)
+	}
+
+	// The live stream connection authenticated with the OLD token is closed.
+	assert.True(s.T(), s.notified)
+	assert.Equal(s.T(), uint(5), s.notifiedUserID)
+	assert.Equal(s.T(), firstClientToken, s.notifiedToken)
+}
+
+func (s *ClientSuite) Test_RotateClientToken_expectNotFound() {
+	s.db.User(5)
+
+	test.WithUser(s.ctx, 5)
+	s.ctx.Request = httptest.NewRequest("POST", "/client/8/token", nil)
+	s.ctx.AddParam("id", "8")
+
+	s.a.RotateClientToken(s.ctx)
+
+	assert.Equal(s.T(), 404, s.recorder.Code)
+	assert.False(s.T(), s.notified)
+}
+
+func (s *ClientSuite) Test_RotateClientToken_expectNotFoundOnCurrentUserIsNotOwner() {
+	s.db.User(5).NewClientWithToken(8, firstClientToken)
+	s.db.User(2)
+
+	test.WithUser(s.ctx, 2)
+	s.ctx.Request = httptest.NewRequest("POST", "/client/8/token", nil)
+	s.ctx.AddParam("id", "8")
+
+	s.a.RotateClientToken(s.ctx)
+
+	assert.Equal(s.T(), 404, s.recorder.Code)
+	assert.False(s.T(), s.notified)
+	// The token of a client owned by someone else must be untouched.
+	if client, err := s.db.GetClientByID(8); assert.NoError(s.T(), err) {
+		assert.Equal(s.T(), firstClientToken, client.Token)
+	}
 }
 
 func (s *ClientSuite) withFormData(formData string) {
