@@ -24,6 +24,7 @@ type client struct {
 	conn    *websocket.Conn
 	onClose func(*client)
 	write   chan *model.MessageExternal
+	done    chan struct{}
 	userID  uint
 	token   string
 	once    once
@@ -33,6 +34,7 @@ func newClient(conn *websocket.Conn, userID uint, token string, onClose func(*cl
 	return &client{
 		conn:    conn,
 		write:   make(chan *model.MessageExternal, 1),
+		done:    make(chan struct{}),
 		userID:  userID,
 		token:   token,
 		onClose: onClose,
@@ -40,10 +42,15 @@ func newClient(conn *websocket.Conn, userID uint, token string, onClose func(*cl
 }
 
 // Close closes the connection.
+//
+// It signals shutdown by closing the done channel rather than the write channel.
+// The write channel is never closed, so concurrent publishers (see publish) can
+// never panic with a "send on closed channel" while a connection is being torn
+// down by a disconnect, a deleted user, or an expired/revoked client.
 func (c *client) Close() {
 	c.once.Do(func() {
 		c.conn.Close()
-		close(c.write)
+		close(c.done)
 	})
 }
 
@@ -51,9 +58,20 @@ func (c *client) Close() {
 func (c *client) NotifyClose() {
 	c.once.Do(func() {
 		c.conn.Close()
-		close(c.write)
+		close(c.done)
 		c.onClose(c)
 	})
+}
+
+// publish enqueues a message for delivery to the client. It is safe to call
+// concurrently with Close/NotifyClose: the write channel is never closed, and a
+// client that is shutting down is detected via the done channel, so publish
+// always returns promptly instead of blocking on a connection that is going away.
+func (c *client) publish(msg *model.MessageExternal) {
+	select {
+	case c.write <- msg:
+	case <-c.done:
+	}
 }
 
 // startWriteHandler starts listening on the client connection. As we do not need anything from the client,
@@ -87,11 +105,7 @@ func (c *client) startWriteHandler(pingPeriod time.Duration) {
 
 	for {
 		select {
-		case message, ok := <-c.write:
-			if !ok {
-				return
-			}
-
+		case message := <-c.write:
 			c.conn.SetWriteDeadline(time.Now().Add(writeWait))
 			if err := writeJSON(c.conn, message); err != nil {
 				printWebSocketError("WriteError", err)
@@ -103,6 +117,8 @@ func (c *client) startWriteHandler(pingPeriod time.Duration) {
 				printWebSocketError("PingError", err)
 				return
 			}
+		case <-c.done:
+			return
 		}
 	}
 }

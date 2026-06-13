@@ -81,12 +81,19 @@ func (a *API) NotifyDeletedClient(userID uint, token string) {
 
 // Notify notifies the clients with the given userID that a new messages was created.
 func (a *API) Notify(userID uint, msg *model.MessageExternal) {
+	// Copy the current set of clients under the read lock, then release it before
+	// writing. Holding the lock while sending would let a single slow or dead
+	// connection block delivery to every other client of the user and stall
+	// concurrent teardown (deleted user, expired/revoked client) that needs the
+	// write lock. publish is safe to call without the lock because it never sends
+	// on a closed channel.
 	a.lock.RLock()
-	defer a.lock.RUnlock()
-	if clients, ok := a.clients[userID]; ok {
-		for _, c := range clients {
-			c.write <- msg
-		}
+	clients := make([]*client, len(a.clients[userID]))
+	copy(clients, a.clients[userID])
+	a.lock.RUnlock()
+
+	for _, c := range clients {
+		c.publish(msg)
 	}
 }
 
