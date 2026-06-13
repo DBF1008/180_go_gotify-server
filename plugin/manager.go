@@ -36,6 +36,7 @@ type Database interface {
 	UpdateApplication(app *model.Application) error
 	GetApplicationsByUser(userID uint) ([]*model.Application, error)
 	GetApplicationByToken(token string) (*model.Application, error)
+	GetMessagesByUserWithFilter(userID uint, limit int, since uint, filter *model.MessageFilter) ([]*model.Message, error)
 }
 
 // Notifier notifies when a new message was created.

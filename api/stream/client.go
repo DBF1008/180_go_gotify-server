@@ -1,6 +1,8 @@
 package stream
 
 import (
+	"encoding/json"
+	"sync"
 	"time"
 
 	"github.com/gorilla/websocket"
@@ -21,12 +23,14 @@ var writeJSON = func(conn *websocket.Conn, v interface{}) error {
 }
 
 type client struct {
-	conn    *websocket.Conn
-	onClose func(*client)
-	write   chan *model.MessageExternal
-	userID  uint
-	token   string
-	once    once
+	conn     *websocket.Conn
+	onClose  func(*client)
+	write    chan *model.MessageExternal
+	userID   uint
+	token    string
+	filterMu sync.RWMutex
+	filter   *model.MessageFilter
+	once     once
 }
 
 func newClient(conn *websocket.Conn, userID uint, token string, onClose func(*client)) *client {
@@ -37,6 +41,20 @@ func newClient(conn *websocket.Conn, userID uint, token string, onClose func(*cl
 		token:   token,
 		onClose: onClose,
 	}
+}
+
+// getFilter returns the client's message filter, or nil if no filter is set.
+func (c *client) getFilter() *model.MessageFilter {
+	c.filterMu.RLock()
+	defer c.filterMu.RUnlock()
+	return c.filter
+}
+
+// setFilter sets the client's message filter. Thread-safe.
+func (c *client) setFilter(f *model.MessageFilter) {
+	c.filterMu.Lock()
+	defer c.filterMu.Unlock()
+	c.filter = f
 }
 
 // Close closes the connection.
@@ -56,20 +74,33 @@ func (c *client) NotifyClose() {
 	})
 }
 
-// startWriteHandler starts listening on the client connection. As we do not need anything from the client,
-// we ignore incoming messages. Leaves the loop on errors.
+// startWriteHandler starts listening on the client connection. The first message
+// received may be a subscription config in JSON format ({"subscribe": {...}}).
+// Subsequent messages are ignored (the server only pushes, never receives commands).
+// Leaves the loop on errors.
 func (c *client) startReading(pongWait time.Duration) {
 	defer c.NotifyClose()
-	c.conn.SetReadLimit(64)
+	c.conn.SetReadLimit(4096)
 	c.conn.SetReadDeadline(time.Now().Add(pongWait))
 	c.conn.SetPongHandler(func(appData string) error {
 		c.conn.SetReadDeadline(time.Now().Add(pongWait))
 		return nil
 	})
+	first := true
 	for {
-		if _, _, err := c.conn.NextReader(); err != nil {
+		_, payload, err := c.conn.ReadMessage()
+		if err != nil {
 			printWebSocketError("ReadError", err)
 			return
+		}
+		if first {
+			first = false
+			var sub struct {
+				Subscribe *model.MessageFilter `json:"subscribe"`
+			}
+			if json.Unmarshal(payload, &sub) == nil && sub.Subscribe != nil {
+				c.setFilter(sub.Subscribe)
+			}
 		}
 	}
 }

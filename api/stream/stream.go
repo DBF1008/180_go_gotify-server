@@ -80,12 +80,16 @@ func (a *API) NotifyDeletedClient(userID uint, token string) {
 }
 
 // Notify notifies the clients with the given userID that a new messages was created.
+// If a client has a filter set, the message is only sent if it matches the filter.
 func (a *API) Notify(userID uint, msg *model.MessageExternal) {
 	a.lock.RLock()
 	defer a.lock.RUnlock()
 	if clients, ok := a.clients[userID]; ok {
 		for _, c := range clients {
-			c.write <- msg
+			f := c.getFilter()
+			if f == nil || f.MatchesMessage(msg) {
+				c.write <- msg
+			}
 		}
 	}
 }

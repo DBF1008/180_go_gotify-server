@@ -19,6 +19,8 @@ type MessageDatabase interface {
 	GetMessagesByApplicationSince(appID uint, limit int, since uint) ([]*model.Message, error)
 	GetApplicationByID(id uint) (*model.Application, error)
 	GetMessagesByUserSince(userID uint, limit int, since uint) ([]*model.Message, error)
+	GetMessagesByUserWithFilter(userID uint, limit int, since uint, filter *model.MessageFilter) ([]*model.Message, error)
+	GetMessagesByApplicationWithFilter(appID uint, limit int, since uint, filter *model.MessageFilter) ([]*model.Message, error)
 	DeleteMessageByID(id uint) error
 	GetMessageByID(id uint) (*model.Message, error)
 	DeleteMessagesByUser(userID uint) error
@@ -39,9 +41,35 @@ type MessageAPI struct {
 	Notifier Notifier
 }
 
-type pagingParams struct {
-	Limit int  `form:"limit" binding:"min=1,max=200"`
-	Since uint `form:"since" binding:"min=0"`
+type messageFilterParams struct {
+	Limit         int        `form:"limit" binding:"min=1,max=200"`
+	Since         uint       `form:"since" binding:"min=0"`
+	ApplicationID *uint      `form:"appid"`
+	Priority      *int       `form:"priority"`
+	PriorityMin   *int       `form:"priority_min"`
+	PriorityMax   *int       `form:"priority_max"`
+	Before        *time.Time `form:"before"`
+	After         *time.Time `form:"after"`
+}
+
+func (p *messageFilterParams) toFilter() *model.MessageFilter {
+	return &model.MessageFilter{
+		ApplicationID: p.ApplicationID,
+		Priority:      p.Priority,
+		PriorityMin:   p.PriorityMin,
+		PriorityMax:   p.PriorityMax,
+		Before:        p.Before,
+		After:         p.After,
+	}
+}
+
+func withMessageFilter(ctx *gin.Context, f func(params *messageFilterParams)) {
+	params := &messageFilterParams{Limit: 100}
+	if err := ctx.ShouldBindWith(params, binding.Query); err == nil {
+		f(params)
+	} else {
+		ctx.AbortWithError(400, err)
+	}
 }
 
 // GetMessages returns all messages from a user.
@@ -87,41 +115,55 @@ type pagingParams struct {
 //	        $ref: "#/definitions/Error"
 func (a *MessageAPI) GetMessages(ctx *gin.Context) {
 	userID := auth.GetUserID(ctx)
-	withPaging(ctx, func(params *pagingParams) {
+	withMessageFilter(ctx, func(params *messageFilterParams) {
 		// the +1 is used to check if there are more messages and will be removed on buildWithPaging
-		messages, err := a.DB.GetMessagesByUserSince(userID, params.Limit+1, params.Since)
+		messages, err := a.DB.GetMessagesByUserWithFilter(userID, params.Limit+1, params.Since, params.toFilter())
 		if success := successOrAbort(ctx, 500, err); !success {
 			return
 		}
-		ctx.JSON(200, buildWithPaging(ctx, params, messages))
+		ctx.JSON(200, buildWithPagingAndFilter(ctx, params, messages))
 	})
 }
 
-func buildWithPaging(ctx *gin.Context, paging *pagingParams, messages []*model.Message) *model.PagedMessages {
+func buildWithPagingAndFilter(ctx *gin.Context, params *messageFilterParams, messages []*model.Message) *model.PagedMessages {
 	next := ""
 	since := uint(0)
 	useMessages := messages
-	if len(messages) > paging.Limit {
+	if len(messages) > params.Limit {
 		useMessages = messages[:len(messages)-1]
 		since = useMessages[len(useMessages)-1].ID
 		url := location.Get(ctx)
 		url.Path = ctx.Request.URL.Path
 		query := url.Query()
-		query.Add("limit", strconv.Itoa(paging.Limit))
+		query.Add("limit", strconv.Itoa(params.Limit))
 		query.Add("since", strconv.FormatUint(uint64(since), 10))
+
+		// Preserve all active filter parameters in the next-page URL
+		if params.ApplicationID != nil {
+			query.Add("appid", strconv.FormatUint(uint64(*params.ApplicationID), 10))
+		}
+		if params.Priority != nil {
+			query.Add("priority", strconv.Itoa(*params.Priority))
+		}
+		if params.PriorityMin != nil {
+			query.Add("priority_min", strconv.Itoa(*params.PriorityMin))
+		}
+		if params.PriorityMax != nil {
+			query.Add("priority_max", strconv.Itoa(*params.PriorityMax))
+		}
+		if params.Before != nil {
+			query.Add("before", params.Before.Format(time.RFC3339))
+		}
+		if params.After != nil {
+			query.Add("after", params.After.Format(time.RFC3339))
+		}
+
 		url.RawQuery = query.Encode()
 		next = url.String()
 	}
 	return &model.PagedMessages{
-		Paging:   model.Paging{Size: len(useMessages), Limit: paging.Limit, Next: next, Since: since},
+		Paging:   model.Paging{Size: len(useMessages), Limit: params.Limit, Next: next, Since: since},
 		Messages: toExternalMessages(useMessages),
-	}
-}
-
-func withPaging(ctx *gin.Context, f func(pagingParams *pagingParams)) {
-	params := &pagingParams{Limit: 100}
-	if err := ctx.MustBindWith(params, binding.Query); err == nil {
-		f(params)
 	}
 }
 
@@ -178,18 +220,18 @@ func withPaging(ctx *gin.Context, f func(pagingParams *pagingParams)) {
 //	        $ref: "#/definitions/Error"
 func (a *MessageAPI) GetMessagesWithApplication(ctx *gin.Context) {
 	withID(ctx, "id", func(id uint) {
-		withPaging(ctx, func(params *pagingParams) {
+		withMessageFilter(ctx, func(params *messageFilterParams) {
 			app, err := a.DB.GetApplicationByID(id)
 			if success := successOrAbort(ctx, 500, err); !success {
 				return
 			}
 			if app != nil && app.UserID == auth.GetUserID(ctx) {
 				// the +1 is used to check if there are more messages and will be removed on buildWithPaging
-				messages, err := a.DB.GetMessagesByApplicationSince(id, params.Limit+1, params.Since)
+				messages, err := a.DB.GetMessagesByApplicationWithFilter(id, params.Limit+1, params.Since, params.toFilter())
 				if success := successOrAbort(ctx, 500, err); !success {
 					return
 				}
-				ctx.JSON(200, buildWithPaging(ctx, params, messages))
+				ctx.JSON(200, buildWithPagingAndFilter(ctx, params, messages))
 			} else {
 				ctx.AbortWithError(404, errors.New("application does not exist"))
 			}

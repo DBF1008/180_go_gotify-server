@@ -82,6 +82,30 @@ type StorageHandler interface {
 	Load() ([]byte, error)
 }
 
+// MessageQuerier is an optional capability for querying messages with filters.
+// Plugins can check if the database supports this interface via type assertion.
+type MessageQuerier interface {
+	GetMessages(userID uint, limit int, since uint, filter *MessageFilter) ([]*QueriedMessage, error)
+}
+
+// MessageFilter mirrors model.MessageFilter for the plugin compatibility layer.
+type MessageFilter struct {
+	ApplicationID *uint
+	Priority      *int
+	PriorityMin   *int
+	PriorityMax   *int
+}
+
+// QueriedMessage represents a message returned from a query.
+type QueriedMessage struct {
+	ID            uint
+	ApplicationID uint
+	Message       string
+	Title         string
+	Priority      int
+	Date          int64 // Unix timestamp
+}
+
 // Message describes a message to be send by MessageHandler#SendMessage.
 type Message struct {
 	Message  string

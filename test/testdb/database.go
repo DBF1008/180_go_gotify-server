@@ -186,6 +186,27 @@ func (mb *MessageBuilder) NewMessage(id uint) model.Message {
 	return message
 }
 
+// NewMessageWithPriority creates a message with a specific priority and returns the message.
+func (mb *MessageBuilder) NewMessageWithPriority(id uint, priority int) model.Message {
+	message := model.Message{ID: id, ApplicationID: mb.appID, Priority: priority}
+	mb.db.CreateMessage(&message)
+	return message
+}
+
+// NewMessageWithDate creates a message with a specific date and returns the message.
+func (mb *MessageBuilder) NewMessageWithDate(id uint, date time.Time) model.Message {
+	message := model.Message{ID: id, ApplicationID: mb.appID, Date: date}
+	mb.db.CreateMessage(&message)
+	return message
+}
+
+// NewMessageFull creates a message with priority, title, and date and returns the message.
+func (mb *MessageBuilder) NewMessageFull(id uint, priority int, title string, date time.Time) model.Message {
+	message := model.Message{ID: id, ApplicationID: mb.appID, Priority: priority, Title: title, Date: date}
+	mb.db.CreateMessage(&message)
+	return message
+}
+
 // AssertAppNotExist asserts that the app does not exist.
 func (d *Database) AssertAppNotExist(id uint) {
 	if app, err := d.GetApplicationByID(id); assert.NoError(d.t, err) {
