@@ -75,17 +75,32 @@ func (a *API) NotifyDeletedClient(userID uint, token string) {
 				clients = append(clients[:i], clients[i+1:]...)
 			}
 		}
-		a.clients[userID] = clients
+		if len(clients) == 0 {
+			delete(a.clients, userID)
+		} else {
+			a.clients[userID] = clients
+		}
 	}
 }
 
 // Notify notifies the clients with the given userID that a new messages was created.
 func (a *API) Notify(userID uint, msg *model.MessageExternal) {
 	a.lock.RLock()
-	defer a.lock.RUnlock()
+	var targets []*client
 	if clients, ok := a.clients[userID]; ok {
-		for _, c := range clients {
-			c.write <- msg
+		targets = make([]*client, len(clients))
+		copy(targets, clients)
+	}
+	a.lock.RUnlock()
+
+	for _, c := range targets {
+		if c.closed.Load() {
+			continue
+		}
+		select {
+		case c.write <- msg:
+		default:
+			// buffer full, client is slow — drop message to avoid blocking
 		}
 	}
 }
@@ -96,7 +111,12 @@ func (a *API) remove(remove *client) {
 	if userIDClients, ok := a.clients[remove.userID]; ok {
 		for i, client := range userIDClients {
 			if client == remove {
-				a.clients[remove.userID] = append(userIDClients[:i], userIDClients[i+1:]...)
+				newClients := append(userIDClients[:i], userIDClients[i+1:]...)
+				if len(newClients) == 0 {
+					delete(a.clients, remove.userID)
+				} else {
+					a.clients[remove.userID] = newClients
+				}
 				break
 			}
 		}

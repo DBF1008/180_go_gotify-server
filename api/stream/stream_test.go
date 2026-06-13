@@ -9,6 +9,7 @@ import (
 	"net/http/httptest"
 	"sort"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
@@ -617,4 +618,336 @@ func waitForConnectedClients(api *API, count int) {
 		}
 		time.Sleep(10 * time.Millisecond)
 	}
+}
+
+func hasUser(a *API, userID uint) bool {
+	a.lock.RLock()
+	defer a.lock.RUnlock()
+	_, ok := a.clients[userID]
+	return ok
+}
+
+// TestConcurrentNotifyAndDisconnect exercises the race between Notify() sending
+// messages and clients disconnecting concurrently. It verifies that no panic occurs
+// when connections are closed while broadcasts are in flight.
+func TestConcurrentNotifyAndDisconnect(t *testing.T) {
+	mode.Set(mode.TestDev)
+
+	server, api := bootTestServer(staticUserID())
+	defer server.Close()
+	defer api.Close()
+
+	wsURL := wsURL(server.URL)
+
+	const numClients = 10
+	wsClients := make([]*testingClient, numClients)
+	for i := 0; i < numClients; i++ {
+		wsClients[i] = testClient(t, wsURL)
+	}
+
+	waitForConnectedClients(api, numClients)
+
+	var wg sync.WaitGroup
+
+	// Concurrent Notify goroutines
+	for g := 0; g < 5; g++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			for i := 0; i < 200; i++ {
+				api.Notify(1, &model.MessageExternal{Message: "concurrent"})
+			}
+		}()
+	}
+
+	// Concurrent client disconnect goroutines
+	for i := 0; i < numClients; i++ {
+		wg.Add(1)
+		go func(idx int) {
+			defer wg.Done()
+			wsClients[idx].conn.Close()
+		}(i)
+	}
+
+	done := make(chan struct{})
+	go func() {
+		wg.Wait()
+		close(done)
+	}()
+
+	select {
+	case <-done:
+		// completed without panic
+	case <-time.After(10 * time.Second):
+		t.Fatal("test timed out — possible deadlock")
+	}
+}
+
+// TestConcurrentNotifyAndDeleteClient exercises the race between Notify() and
+// NotifyDeletedClient() (client revocation). It verifies no panic occurs and that
+// revoked clients are properly removed from the server's client map.
+func TestConcurrentNotifyAndDeleteClient(t *testing.T) {
+	mode.Set(mode.TestDev)
+
+	userIDs := []uint{1, 1, 1, 1}
+	tokens := []string{"keep", "revoke", "revoke", "keep"}
+	i := 0
+	server, api := bootTestServer(func(context *gin.Context) {
+		auth.RegisterClient(context, &model.Client{UserID: userIDs[i], Token: tokens[i]})
+		i++
+	})
+	defer server.Close()
+	defer api.Close()
+
+	wsURL := wsURL(server.URL)
+
+	for j := 0; j < 4; j++ {
+		testClient(t, wsURL)
+	}
+
+	waitForConnectedClients(api, 4)
+
+	var wg sync.WaitGroup
+
+	// Tight Notify loop
+	wg.Add(1)
+	go func() {
+		defer wg.Done()
+		for i := 0; i < 500; i++ {
+			api.Notify(1, &model.MessageExternal{Message: "race"})
+		}
+	}()
+
+	// Revoke clients by token
+	wg.Add(1)
+	go func() {
+		defer wg.Done()
+		api.NotifyDeletedClient(1, "revoke")
+	}()
+
+	done := make(chan struct{})
+	go func() {
+		wg.Wait()
+		close(done)
+	}()
+
+	select {
+	case <-done:
+		// completed without panic
+	case <-time.After(10 * time.Second):
+		t.Fatal("test timed out — possible deadlock")
+	}
+
+	// Wait for cleanup to propagate
+	time.Sleep(500 * time.Millisecond)
+
+	// Only "keep" token clients should remain
+	assert.Equal(t, 2, countClients(api))
+}
+
+// TestConcurrentNotifyAndDeleteUser exercises the race between Notify() and
+// NotifyDeletedUser() (user deletion / force-offline). It verifies no panic occurs
+// and that all connections for the deleted user are properly closed.
+func TestConcurrentNotifyAndDeleteUser(t *testing.T) {
+	mode.Set(mode.TestDev)
+
+	userIDs := []uint{1, 1, 1, 1, 1}
+	tokens := []string{"a", "b", "c", "d", "e"}
+	i := 0
+	server, api := bootTestServer(func(context *gin.Context) {
+		auth.RegisterClient(context, &model.Client{UserID: userIDs[i], Token: tokens[i]})
+		i++
+	})
+	defer server.Close()
+	defer api.Close()
+
+	wsURL := wsURL(server.URL)
+
+	wsClients := make([]*testingClient, 5)
+	for j := 0; j < 5; j++ {
+		wsClients[j] = testClient(t, wsURL)
+	}
+
+	waitForConnectedClients(api, 5)
+
+	var wg sync.WaitGroup
+
+	// Tight Notify loop
+	for g := 0; g < 3; g++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			for i := 0; i < 200; i++ {
+				api.Notify(1, &model.MessageExternal{Message: "race"})
+			}
+		}()
+	}
+
+	// Delete user concurrently
+	wg.Add(1)
+	go func() {
+		defer wg.Done()
+		api.NotifyDeletedUser(1)
+	}()
+
+	done := make(chan struct{})
+	go func() {
+		wg.Wait()
+		close(done)
+	}()
+
+	select {
+	case <-done:
+		// completed without panic
+	case <-time.After(10 * time.Second):
+		t.Fatal("test timed out — possible deadlock")
+	}
+
+	// Wait for cleanup to propagate
+	time.Sleep(100 * time.Millisecond)
+
+	// All connections for user 1 should be gone
+	assert.Equal(t, 0, countClients(api))
+
+	// Subsequent Notify should be a harmless no-op
+	api.Notify(1, &model.MessageExternal{Message: "after-delete"})
+}
+
+// TestConcurrentNotifyAndExpirationCleanup simulates the expiration cleanup path
+// (the 5-minute ticker in router.go) racing with concurrent Notify calls.
+func TestConcurrentNotifyAndExpirationCleanup(t *testing.T) {
+	mode.Set(mode.TestDev)
+
+	userIDs := []uint{1, 1, 1, 1}
+	tokens := []string{"active", "active", "expired", "expired"}
+	i := 0
+	server, api := bootTestServer(func(context *gin.Context) {
+		auth.RegisterClient(context, &model.Client{UserID: userIDs[i], Token: tokens[i]})
+		i++
+	})
+	defer server.Close()
+	defer api.Close()
+
+	wsURL := wsURL(server.URL)
+
+	for j := 0; j < 4; j++ {
+		testClient(t, wsURL)
+	}
+
+	waitForConnectedClients(api, 4)
+
+	var wg sync.WaitGroup
+
+	// Simulate expiration cleanup revoking "expired" token clients
+	wg.Add(1)
+	go func() {
+		defer wg.Done()
+		api.NotifyDeletedClient(1, "expired")
+	}()
+
+	// Concurrent Notify
+	wg.Add(1)
+	go func() {
+		defer wg.Done()
+		for i := 0; i < 500; i++ {
+			api.Notify(1, &model.MessageExternal{Message: "tick"})
+		}
+	}()
+
+	done := make(chan struct{})
+	go func() {
+		wg.Wait()
+		close(done)
+	}()
+
+	select {
+	case <-done:
+		// completed without panic
+	case <-time.After(10 * time.Second):
+		t.Fatal("test timed out — possible deadlock")
+	}
+
+	// Wait for cleanup
+	time.Sleep(500 * time.Millisecond)
+
+	// Only "active" clients should remain
+	assert.Equal(t, 2, countClients(api))
+}
+
+// TestNotifySlowConsumerDoesNotBlock verifies that Notify does not block when a
+// client's write buffer is full (slow consumer). Messages are dropped instead of
+// blocking the caller, preventing the push pipeline from freezing.
+func TestNotifySlowConsumerDoesNotBlock(t *testing.T) {
+	mode.Set(mode.TestDev)
+
+	// Use a blocking writeJSON that waits on a channel.
+	// Set it BEFORE the server starts so there's no race with the write handler.
+	writeBlock := make(chan struct{})
+
+	oldWrite := writeJSON
+	writeJSON = func(conn *websocket.Conn, v interface{}) error {
+		<-writeBlock
+		return errors.New("blocked")
+	}
+
+	server, api := bootTestServer(staticUserID())
+	defer server.Close()
+
+	wsURL := wsURL(server.URL)
+	ws := testClient(t, wsURL)
+
+	waitForConnectedClients(api, 1)
+
+	// First Notify: message enters the write channel buffer (cap=1).
+	// The write handler picks it up and blocks in writeJSON (waiting on writeBlock).
+	api.Notify(1, &model.MessageExternal{Message: "fill1"})
+	time.Sleep(50 * time.Millisecond)
+
+	// Second Notify: the buffer is empty (handler consumed it) but handler is
+	// blocked in writeJSON. This fills the buffer again.
+	api.Notify(1, &model.MessageExternal{Message: "fill2"})
+	time.Sleep(10 * time.Millisecond)
+
+	// Now both the buffer (cap=1) is full AND the write handler is blocked.
+	// These Notify calls MUST NOT block — select/default drops the message.
+	start := time.Now()
+	for i := 0; i < 10; i++ {
+		api.Notify(1, &model.MessageExternal{Message: "must-not-block"})
+	}
+	elapsed := time.Since(start)
+
+	assert.Less(t, elapsed, time.Second, "Notify blocked on slow consumer")
+
+	// Clean up: unblock the write handler, then shut down everything before
+	// restoring writeJSON to avoid a data race on the global variable.
+	close(writeBlock)
+	ws.conn.Close()
+	api.Close()
+	time.Sleep(100 * time.Millisecond) // let goroutines drain
+	writeJSON = oldWrite
+}
+
+// TestRemoveLastClientCleansMapEntry verifies that when the last WebSocket connection
+// for a user disconnects, the user's entry is removed from the clients map entirely.
+func TestRemoveLastClientCleansMapEntry(t *testing.T) {
+	mode.Set(mode.TestDev)
+
+	server, api := bootTestServer(staticUserID())
+	defer server.Close()
+	defer api.Close()
+
+	wsURL := wsURL(server.URL)
+	ws := testClient(t, wsURL)
+
+	waitForConnectedClients(api, 1)
+	assert.True(t, hasUser(api, 1))
+
+	// Disconnect the only client
+	ws.conn.Close()
+
+	// Wait for server to process the disconnect
+	time.Sleep(500 * time.Millisecond)
+
+	// The map entry for user 1 should be gone entirely
+	assert.False(t, hasUser(api, 1))
 }

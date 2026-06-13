@@ -1,6 +1,7 @@
 package stream
 
 import (
+	"sync/atomic"
 	"time"
 
 	"github.com/gorilla/websocket"
@@ -27,6 +28,8 @@ type client struct {
 	userID  uint
 	token   string
 	once    once
+	closed  atomic.Bool
+	done    chan struct{}
 }
 
 func newClient(conn *websocket.Conn, userID uint, token string, onClose func(*client)) *client {
@@ -36,22 +39,25 @@ func newClient(conn *websocket.Conn, userID uint, token string, onClose func(*cl
 		userID:  userID,
 		token:   token,
 		onClose: onClose,
+		done:    make(chan struct{}),
 	}
 }
 
 // Close closes the connection.
 func (c *client) Close() {
 	c.once.Do(func() {
+		c.closed.Store(true)
+		close(c.done)
 		c.conn.Close()
-		close(c.write)
 	})
 }
 
 // NotifyClose closes the connection and notifies that the connection was closed.
 func (c *client) NotifyClose() {
 	c.once.Do(func() {
+		c.closed.Store(true)
+		close(c.done)
 		c.conn.Close()
-		close(c.write)
 		c.onClose(c)
 	})
 }
@@ -87,16 +93,14 @@ func (c *client) startWriteHandler(pingPeriod time.Duration) {
 
 	for {
 		select {
-		case message, ok := <-c.write:
-			if !ok {
-				return
-			}
-
+		case message := <-c.write:
 			c.conn.SetWriteDeadline(time.Now().Add(writeWait))
 			if err := writeJSON(c.conn, message); err != nil {
 				printWebSocketError("WriteError", err)
 				return
 			}
+		case <-c.done:
+			return
 		case <-pingTicker.C:
 			c.conn.SetWriteDeadline(time.Now().Add(writeWait))
 			if err := ping(c.conn); err != nil {
