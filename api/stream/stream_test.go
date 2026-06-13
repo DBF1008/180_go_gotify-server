@@ -618,3 +618,80 @@ func waitForConnectedClients(api *API, count int) {
 		time.Sleep(10 * time.Millisecond)
 	}
 }
+
+func priorityPtr(p int) *int { return &p }
+
+func TestNotifyRespectsClientFilter(t *testing.T) {
+	mode.Set(mode.TestDev)
+	defer leaktest.Check(t)()
+
+	server, api := bootTestServer(staticUserID())
+	defer server.Close()
+	defer api.Close()
+
+	base := wsURL(server.URL)
+	filtered := testClient(t, base+"?priorityFrom=5")
+	defer filtered.conn.Close()
+	unfiltered := testClient(t, base)
+	defer unfiltered.conn.Close()
+
+	waitForConnectedClients(api, 2)
+
+	high := &model.MessageExternal{ID: 1, Message: "high", Priority: priorityPtr(8)}
+	low := &model.MessageExternal{ID: 2, Message: "low", Priority: priorityPtr(1)}
+
+	// the high-priority message satisfies the filter and reaches both clients
+	api.Notify(1, high)
+	filtered.expectMessage(high)
+	unfiltered.expectMessage(high)
+
+	// the low-priority message is dropped for the filtered client only
+	api.Notify(1, low)
+	filtered.expectNoMessage()
+	unfiltered.expectMessage(low)
+
+	api.Close()
+}
+
+func TestNotifyRespectsAppIDFilter(t *testing.T) {
+	mode.Set(mode.TestDev)
+	defer leaktest.Check(t)()
+
+	server, api := bootTestServer(staticUserID())
+	defer server.Close()
+	defer api.Close()
+
+	client := testClient(t, wsURL(server.URL)+"?appid=2")
+	defer client.conn.Close()
+
+	waitForConnectedClients(api, 1)
+
+	wanted := &model.MessageExternal{ID: 1, ApplicationID: 2, Message: "from app 2"}
+	other := &model.MessageExternal{ID: 2, ApplicationID: 3, Message: "from app 3"}
+
+	api.Notify(1, other)
+	client.expectNoMessage()
+
+	api.Notify(1, wanted)
+	client.expectMessage(wanted)
+
+	api.Close()
+}
+
+func TestStreamRejectsInvalidFilter(t *testing.T) {
+	mode.Set(mode.TestDev)
+	defer leaktest.Check(t)()
+
+	server, api := bootTestServer(staticUserID())
+	defer server.Close()
+	defer api.Close()
+
+	_, resp, err := websocket.DefaultDialer.Dial(wsURL(server.URL)+"?priorityFrom=abc", nil)
+	// the handshake fails because the handler aborts with 400 before upgrading
+	assert.Error(t, err)
+	if resp != nil {
+		assert.Equal(t, 400, resp.StatusCode)
+		resp.Body.Close()
+	}
+	assert.Empty(t, clients(api, 1), "no client should be registered for a rejected request")
+}

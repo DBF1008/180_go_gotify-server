@@ -16,9 +16,9 @@ import (
 
 // The MessageDatabase interface for encapsulating database access.
 type MessageDatabase interface {
-	GetMessagesByApplicationSince(appID uint, limit int, since uint) ([]*model.Message, error)
+	GetMessagesByApplicationWithFilter(appID uint, filter *model.MessageFilter, limit int, since uint) ([]*model.Message, error)
 	GetApplicationByID(id uint) (*model.Application, error)
-	GetMessagesByUserSince(userID uint, limit int, since uint) ([]*model.Message, error)
+	GetMessagesByUserWithFilter(userID uint, filter *model.MessageFilter, limit int, since uint) ([]*model.Message, error)
 	DeleteMessageByID(id uint) error
 	GetMessageByID(id uint) (*model.Message, error)
 	DeleteMessagesByUser(userID uint) error
@@ -68,6 +68,37 @@ type pagingParams struct {
 //	  required: false
 //	  type: integer
 //	  format: int64
+//	- name: appid
+//	  in: query
+//	  description: return only messages from these application ids (repeatable)
+//	  required: false
+//	  type: array
+//	  collectionFormat: multi
+//	  items:
+//	    type: integer
+//	    format: int64
+//	- name: priorityFrom
+//	  in: query
+//	  description: return only messages with a priority greater than or equal to this value
+//	  required: false
+//	  type: integer
+//	- name: priorityUntil
+//	  in: query
+//	  description: return only messages with a priority less than or equal to this value
+//	  required: false
+//	  type: integer
+//	- name: dateFrom
+//	  in: query
+//	  description: return only messages created at or after this RFC3339 timestamp
+//	  required: false
+//	  type: string
+//	  format: date-time
+//	- name: dateUntil
+//	  in: query
+//	  description: return only messages created at or before this RFC3339 timestamp
+//	  required: false
+//	  type: string
+//	  format: date-time
 //	responses:
 //	  200:
 //	    description: Ok
@@ -88,16 +119,20 @@ type pagingParams struct {
 func (a *MessageAPI) GetMessages(ctx *gin.Context) {
 	userID := auth.GetUserID(ctx)
 	withPaging(ctx, func(params *pagingParams) {
+		filter, err := model.ParseMessageFilter(ctx.Request.URL.Query())
+		if success := successOrAbort(ctx, 400, err); !success {
+			return
+		}
 		// the +1 is used to check if there are more messages and will be removed on buildWithPaging
-		messages, err := a.DB.GetMessagesByUserSince(userID, params.Limit+1, params.Since)
+		messages, err := a.DB.GetMessagesByUserWithFilter(userID, filter, params.Limit+1, params.Since)
 		if success := successOrAbort(ctx, 500, err); !success {
 			return
 		}
-		ctx.JSON(200, buildWithPaging(ctx, params, messages))
+		ctx.JSON(200, buildWithPaging(ctx, params, filter, messages))
 	})
 }
 
-func buildWithPaging(ctx *gin.Context, paging *pagingParams, messages []*model.Message) *model.PagedMessages {
+func buildWithPaging(ctx *gin.Context, paging *pagingParams, filter *model.MessageFilter, messages []*model.Message) *model.PagedMessages {
 	next := ""
 	since := uint(0)
 	useMessages := messages
@@ -109,6 +144,8 @@ func buildWithPaging(ctx *gin.Context, paging *pagingParams, messages []*model.M
 		query := url.Query()
 		query.Add("limit", strconv.Itoa(paging.Limit))
 		query.Add("since", strconv.FormatUint(uint64(since), 10))
+		// carry the active filter forward so paging stays consistent across pages
+		filter.AddToQuery(query)
 		url.RawQuery = query.Encode()
 		next = url.String()
 	}
@@ -155,6 +192,28 @@ func withPaging(ctx *gin.Context, f func(pagingParams *pagingParams)) {
 //	  required: false
 //	  type: integer
 //	  format: int64
+//	- name: priorityFrom
+//	  in: query
+//	  description: return only messages with a priority greater than or equal to this value
+//	  required: false
+//	  type: integer
+//	- name: priorityUntil
+//	  in: query
+//	  description: return only messages with a priority less than or equal to this value
+//	  required: false
+//	  type: integer
+//	- name: dateFrom
+//	  in: query
+//	  description: return only messages created at or after this RFC3339 timestamp
+//	  required: false
+//	  type: string
+//	  format: date-time
+//	- name: dateUntil
+//	  in: query
+//	  description: return only messages created at or before this RFC3339 timestamp
+//	  required: false
+//	  type: string
+//	  format: date-time
 //	responses:
 //	  200:
 //	    description: Ok
@@ -184,12 +243,18 @@ func (a *MessageAPI) GetMessagesWithApplication(ctx *gin.Context) {
 				return
 			}
 			if app != nil && app.UserID == auth.GetUserID(ctx) {
+				filter, err := model.ParseMessageFilter(ctx.Request.URL.Query())
+				if success := successOrAbort(ctx, 400, err); !success {
+					return
+				}
+				// the application is fixed by the path, so an appid filter is meaningless here
+				filter.AppIDs = nil
 				// the +1 is used to check if there are more messages and will be removed on buildWithPaging
-				messages, err := a.DB.GetMessagesByApplicationSince(id, params.Limit+1, params.Since)
+				messages, err := a.DB.GetMessagesByApplicationWithFilter(id, filter, params.Limit+1, params.Since)
 				if success := successOrAbort(ctx, 500, err); !success {
 					return
 				}
-				ctx.JSON(200, buildWithPaging(ctx, params, messages))
+				ctx.JSON(200, buildWithPaging(ctx, params, filter, messages))
 			} else {
 				ctx.AbortWithError(404, errors.New("application does not exist"))
 			}

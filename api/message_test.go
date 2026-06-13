@@ -1,6 +1,7 @@
 package api
 
 import (
+	"encoding/json"
 	"net/http/httptest"
 	"net/url"
 	"strings"
@@ -14,6 +15,7 @@ import (
 	"github.com/gotify/server/v2/test"
 	"github.com/gotify/server/v2/test/testdb"
 	"github.com/stretchr/testify/assert"
+	"github.com/stretchr/testify/require"
 	"github.com/stretchr/testify/suite"
 )
 
@@ -656,4 +658,172 @@ func (s *MessageSuite) withURL(scheme, host, path, query string) {
 
 func intPtr(x int) *int {
 	return &x
+}
+
+// requestPage runs the given handler with a fresh context/recorder and returns
+// the decoded paged response. It lets a test follow pagination links by issuing
+// successive requests.
+func (s *MessageSuite) requestPage(handler func(*gin.Context), userID uint, path, rawQuery string, params gin.Params) *model.PagedMessages {
+	s.recorder = httptest.NewRecorder()
+	s.ctx, _ = gin.CreateTestContext(s.recorder)
+	s.ctx.Request = httptest.NewRequest("GET", "/", nil)
+	s.ctx.Params = params
+	s.withURL("http", "example.com", path, rawQuery)
+	test.WithUser(s.ctx, userID)
+
+	handler(s.ctx)
+
+	require.Equal(s.T(), 200, s.recorder.Code, s.recorder.Body.String())
+	var paged model.PagedMessages
+	require.NoError(s.T(), json.Unmarshal(s.recorder.Body.Bytes(), &paged))
+	return &paged
+}
+
+func messageIDs(msgs []*model.MessageExternal) []uint {
+	ids := make([]uint, len(msgs))
+	for i, m := range msgs {
+		ids[i] = m.ID
+	}
+	return ids
+}
+
+func rawQueryOf(t *testing.T, rawURL string) string {
+	u, err := url.Parse(rawURL)
+	require.NoError(t, err)
+	return u.RawQuery
+}
+
+func (s *MessageSuite) Test_GetMessages_WithFilter_PaginationContinuity() {
+	user := s.db.User(5)
+	app1 := user.App(1)
+	app2 := user.App(2)
+	// even ids land in app2 with high priority, odd ids in app1 with low priority
+	for i := uint(1); i <= 20; i++ {
+		if i%2 == 0 {
+			app2.NewMessageWith(i, 8, testdb.Now)
+		} else {
+			app1.NewMessageWith(i, 1, testdb.Now)
+		}
+	}
+
+	// priorityFrom=8 selects the even ids 2..20; page through them in steps of 3
+	// and assert that each "next" link carries the filter forward.
+	page1 := s.requestPage(s.a.GetMessages, 5, "/messages", "limit=3&priorityFrom=8", nil)
+	assert.Equal(s.T(), []uint{20, 18, 16}, messageIDs(page1.Messages))
+	assert.Equal(s.T(), uint(16), page1.Paging.Since)
+	assert.Equal(s.T(), "http://example.com/messages?limit=3&priorityFrom=8&since=16", page1.Paging.Next)
+
+	page2 := s.requestPage(s.a.GetMessages, 5, "/messages", rawQueryOf(s.T(), page1.Paging.Next), nil)
+	assert.Equal(s.T(), []uint{14, 12, 10}, messageIDs(page2.Messages))
+	assert.Equal(s.T(), "http://example.com/messages?limit=3&priorityFrom=8&since=10", page2.Paging.Next)
+
+	page3 := s.requestPage(s.a.GetMessages, 5, "/messages", rawQueryOf(s.T(), page2.Paging.Next), nil)
+	assert.Equal(s.T(), []uint{8, 6, 4}, messageIDs(page3.Messages))
+	assert.Equal(s.T(), "http://example.com/messages?limit=3&priorityFrom=8&since=4", page3.Paging.Next)
+
+	page4 := s.requestPage(s.a.GetMessages, 5, "/messages", rawQueryOf(s.T(), page3.Paging.Next), nil)
+	assert.Equal(s.T(), []uint{2}, messageIDs(page4.Messages))
+	assert.Empty(s.T(), page4.Paging.Next, "last page must not advertise a next link")
+}
+
+func (s *MessageSuite) Test_GetMessages_WithFilter_MultiCondition_PreservedInNext() {
+	day := func(n int) time.Time { return testdb.Now.AddDate(0, 0, n) }
+	user := s.db.User(5)
+	app1 := user.App(1)
+	app2 := user.App(2)
+	app1.NewMessageWith(1, 10, day(1))
+	app2.NewMessageWith(2, 3, day(2))
+	app2.NewMessageWith(3, 7, day(3))
+	app1.NewMessageWith(4, 8, day(4))
+	app2.NewMessageWith(5, 9, day(5))
+
+	// app2 AND priority>=5 AND day(3)<=date<=day(5) -> ids 5 then 3
+	query := "appid=2&priorityFrom=5&dateFrom=" + day(3).Format(time.RFC3339) +
+		"&dateUntil=" + day(5).Format(time.RFC3339) + "&limit=1"
+	page1 := s.requestPage(s.a.GetMessages, 5, "/messages", query, nil)
+	assert.Equal(s.T(), []uint{5}, messageIDs(page1.Messages))
+
+	u, err := url.Parse(page1.Paging.Next)
+	require.NoError(s.T(), err)
+	q := u.Query()
+	assert.Equal(s.T(), "2", q.Get("appid"))
+	assert.Equal(s.T(), "5", q.Get("priorityFrom"))
+	assert.Equal(s.T(), day(3).Format(time.RFC3339), q.Get("dateFrom"))
+	assert.Equal(s.T(), day(5).Format(time.RFC3339), q.Get("dateUntil"))
+	assert.Equal(s.T(), "1", q.Get("limit"))
+	assert.Equal(s.T(), "5", q.Get("since"))
+
+	// following the next link keeps the filter applied
+	page2 := s.requestPage(s.a.GetMessages, 5, "/messages", u.RawQuery, nil)
+	assert.Equal(s.T(), []uint{3}, messageIDs(page2.Messages))
+	assert.Empty(s.T(), page2.Paging.Next)
+}
+
+func (s *MessageSuite) Test_GetMessages_WithMultipleAppIDs() {
+	user := s.db.User(5)
+	user.App(1).NewMessageWith(1, 0, testdb.Now)
+	user.App(2).NewMessageWith(2, 0, testdb.Now)
+	user.App(3).NewMessageWith(3, 0, testdb.Now)
+
+	page := s.requestPage(s.a.GetMessages, 5, "/messages", "appid=1&appid=3", nil)
+	assert.Equal(s.T(), []uint{3, 1}, messageIDs(page.Messages))
+}
+
+func (s *MessageSuite) Test_GetMessagesWithApplication_WithFilter() {
+	user := s.db.User(5)
+	app2 := user.App(2)
+	app2.NewMessageWith(1, 1, testdb.Now)
+	app2.NewMessageWith(2, 8, testdb.Now)
+	app2.NewMessageWith(3, 10, testdb.Now)
+
+	page := s.requestPage(s.a.GetMessagesWithApplication, 5, "/application/2/message", "priorityFrom=8",
+		gin.Params{{Key: "id", Value: "2"}})
+	assert.Equal(s.T(), []uint{3, 2}, messageIDs(page.Messages))
+}
+
+func (s *MessageSuite) Test_GetMessagesWithApplication_IgnoresAppidQuery() {
+	user := s.db.User(5)
+	app1 := user.App(1)
+	app2 := user.App(2)
+	app1.NewMessageWith(1, 5, testdb.Now)
+	app2.NewMessageWith(2, 5, testdb.Now)
+	app2.NewMessageWith(3, 5, testdb.Now)
+
+	// appid=1 in the query is meaningless on this endpoint: the path id (2) wins,
+	// and appid must not leak into the next link.
+	page := s.requestPage(s.a.GetMessagesWithApplication, 5, "/application/2/message", "appid=1&limit=1",
+		gin.Params{{Key: "id", Value: "2"}})
+	assert.Equal(s.T(), []uint{3}, messageIDs(page.Messages))
+
+	u, err := url.Parse(page.Paging.Next)
+	require.NoError(s.T(), err)
+	assert.NotContains(s.T(), u.Query(), "appid")
+	assert.Equal(s.T(), "3", u.Query().Get("since"))
+}
+
+func (s *MessageSuite) Test_GetMessages_BadPriorityFilter_400() {
+	s.db.User(5)
+	test.WithUser(s.ctx, 5)
+	s.withURL("http", "example.com", "/messages", "priorityFrom=abc")
+	s.a.GetMessages(s.ctx)
+
+	assert.Equal(s.T(), 400, s.recorder.Code)
+}
+
+func (s *MessageSuite) Test_GetMessages_BadDateFilter_400() {
+	s.db.User(5)
+	test.WithUser(s.ctx, 5)
+	s.withURL("http", "example.com", "/messages", "dateFrom=notadate")
+	s.a.GetMessages(s.ctx)
+
+	assert.Equal(s.T(), 400, s.recorder.Code)
+}
+
+func (s *MessageSuite) Test_GetMessages_InvalidLimitWinsOverValidFilter_400() {
+	s.db.User(5)
+	test.WithUser(s.ctx, 5)
+	s.withURL("http", "example.com", "/messages", "limit=555&priorityFrom=8")
+	s.a.GetMessages(s.ctx)
+
+	assert.Equal(s.T(), 400, s.recorder.Code)
 }

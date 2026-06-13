@@ -489,6 +489,32 @@
             "description": "return all messages with an ID less than this value",
             "name": "since",
             "in": "query"
+          },
+          {
+            "type": "integer",
+            "description": "return only messages with a priority greater than or equal to this value",
+            "name": "priorityFrom",
+            "in": "query"
+          },
+          {
+            "type": "integer",
+            "description": "return only messages with a priority less than or equal to this value",
+            "name": "priorityUntil",
+            "in": "query"
+          },
+          {
+            "type": "string",
+            "format": "date-time",
+            "description": "return only messages created at or after this RFC3339 timestamp",
+            "name": "dateFrom",
+            "in": "query"
+          },
+          {
+            "type": "string",
+            "format": "date-time",
+            "description": "return only messages created at or before this RFC3339 timestamp",
+            "name": "dateUntil",
+            "in": "query"
           }
         ],
         "responses": {
@@ -1398,6 +1424,43 @@
             "format": "int64",
             "description": "return all messages with an ID less than this value",
             "name": "since",
+            "in": "query"
+          },
+          {
+            "type": "array",
+            "items": {
+              "type": "integer",
+              "format": "int64"
+            },
+            "collectionFormat": "multi",
+            "description": "return only messages from these application ids (repeatable)",
+            "name": "appid",
+            "in": "query"
+          },
+          {
+            "type": "integer",
+            "description": "return only messages with a priority greater than or equal to this value",
+            "name": "priorityFrom",
+            "in": "query"
+          },
+          {
+            "type": "integer",
+            "description": "return only messages with a priority less than or equal to this value",
+            "name": "priorityUntil",
+            "in": "query"
+          },
+          {
+            "type": "string",
+            "format": "date-time",
+            "description": "return only messages created at or after this RFC3339 timestamp",
+            "name": "dateFrom",
+            "in": "query"
+          },
+          {
+            "type": "string",
+            "format": "date-time",
+            "description": "return only messages created at or before this RFC3339 timestamp",
+            "name": "dateUntil",
             "in": "query"
           }
         ],

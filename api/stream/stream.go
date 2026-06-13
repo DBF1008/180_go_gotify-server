@@ -85,7 +85,9 @@ func (a *API) Notify(userID uint, msg *model.MessageExternal) {
 	defer a.lock.RUnlock()
 	if clients, ok := a.clients[userID]; ok {
 		for _, c := range clients {
-			c.write <- msg
+			if c.filter.Matches(msg) {
+				c.write <- msg
+			}
 		}
 	}
 }
@@ -141,6 +143,12 @@ func (a *API) register(client *client) {
 //	    schema:
 //	        $ref: "#/definitions/Error"
 func (a *API) Handle(ctx *gin.Context) {
+	filter, err := model.ParseMessageFilter(ctx.Request.URL.Query())
+	if err != nil {
+		ctx.AbortWithError(400, err)
+		return
+	}
+
 	conn, err := a.upgrader.Upgrade(ctx.Writer, ctx.Request, nil)
 	if err != nil {
 		ctx.Error(err)
@@ -151,7 +159,7 @@ func (a *API) Handle(ctx *gin.Context) {
 	if c := auth.GetClient(ctx); c != nil {
 		token = c.Token
 	}
-	client := newClient(conn, auth.GetUserID(ctx), token, a.remove)
+	client := newClient(conn, auth.GetUserID(ctx), token, filter, a.remove)
 	a.register(client)
 	go client.startReading(a.pongTimeout)
 	go client.startWriteHandler(a.pingPeriod)
