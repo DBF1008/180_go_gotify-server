@@ -87,6 +87,22 @@ func (d *GormDatabase) UpdateClientElevatedUntil(id uint, t *time.Time) error {
 	return d.DB.Model(&model.Client{}).Where("id = ?", id).Update("elevated_until", t).Error
 }
 
+// UpdateClientToken replaces the token of a client identified by id.
+// All other fields (name, expires settings, etc.) are preserved.
+// Returns the updated client.
+func (d *GormDatabase) UpdateClientToken(id uint, newToken string) (*model.Client, error) {
+	client := new(model.Client)
+	if err := d.DB.Where("id = ?", id).First(client).Error; err != nil {
+		return nil, err
+	}
+	client.Token = newToken
+	client.ElevatedUntil = nil
+	if err := d.DB.Save(client).Error; err != nil {
+		return nil, err
+	}
+	return client, nil
+}
+
 // CleanupExpiredClients deletes clients whose expires_at has passed.
 func (d *GormDatabase) CleanupExpiredClients(now time.Time) ([]*model.Client, error) {
 	var expired []*model.Client

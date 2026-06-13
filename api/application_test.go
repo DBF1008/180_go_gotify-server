@@ -667,6 +667,107 @@ func (s *ApplicationSuite) Test_UpdateApplication_duplicateSortKey() {
 	assert.Equal(s.T(), 400, s.recorder.Code)
 }
 
+func (s *ApplicationSuite) Test_RotateApplicationToken_expectSuccess() {
+	s.db.User(5).NewAppWithToken(1, firstApplicationToken)
+
+	test.WithUser(s.ctx, 5)
+	s.ctx.Request = httptest.NewRequest("POST", "/application/1/token", nil)
+	s.ctx.Params = gin.Params{{Key: "id", Value: "1"}}
+
+	s.a.RotateApplicationToken(s.ctx)
+
+	assert.Equal(s.T(), 200, s.recorder.Code)
+
+	app, err := s.db.GetApplicationByID(1)
+	assert.NoError(s.T(), err)
+	assert.NotNil(s.T(), app)
+	assert.NotEqual(s.T(), firstApplicationToken, app.Token)
+	assert.Equal(s.T(), uint(5), app.UserID)
+}
+
+func (s *ApplicationSuite) Test_RotateApplicationToken_preservesConfiguration() {
+	s.db.User(5)
+	app := s.db.User(5).NewAppWithToken(1, firstApplicationToken)
+	app.Name = "my-important-app"
+	app.Description = "important description"
+	app.DefaultPriority = 7
+	app.SortKey = "a5"
+	app.Image = "custom.png"
+	assert.NoError(s.T(), s.db.UpdateApplication(app))
+
+	test.WithUser(s.ctx, 5)
+	s.ctx.Request = httptest.NewRequest("POST", "/application/1/token", nil)
+	s.ctx.Params = gin.Params{{Key: "id", Value: "1"}}
+
+	s.a.RotateApplicationToken(s.ctx)
+
+	assert.Equal(s.T(), 200, s.recorder.Code)
+
+	updated, err := s.db.GetApplicationByID(1)
+	assert.NoError(s.T(), err)
+	assert.NotNil(s.T(), updated)
+	assert.NotEqual(s.T(), firstApplicationToken, updated.Token)
+	assert.Equal(s.T(), "my-important-app", updated.Name)
+	assert.Equal(s.T(), "important description", updated.Description)
+	assert.Equal(s.T(), 7, updated.DefaultPriority)
+	assert.Equal(s.T(), "a5", updated.SortKey)
+	assert.Equal(s.T(), "custom.png", updated.Image)
+}
+
+func (s *ApplicationSuite) Test_RotateApplicationToken_oldTokenNoLongerValid() {
+	s.db.User(5).NewAppWithToken(1, firstApplicationToken)
+
+	test.WithUser(s.ctx, 5)
+	s.ctx.Request = httptest.NewRequest("POST", "/application/1/token", nil)
+	s.ctx.Params = gin.Params{{Key: "id", Value: "1"}}
+
+	s.a.RotateApplicationToken(s.ctx)
+
+	assert.Equal(s.T(), 200, s.recorder.Code)
+
+	// Old token should no longer resolve to an application
+	oldApp, err := s.db.GetApplicationByToken(firstApplicationToken)
+	assert.NoError(s.T(), err)
+	assert.Nil(s.T(), oldApp, "old token should not resolve after rotation")
+
+	// New token should resolve
+	updated, err := s.db.GetApplicationByID(1)
+	assert.NoError(s.T(), err)
+	newApp, err := s.db.GetApplicationByToken(updated.Token)
+	assert.NoError(s.T(), err)
+	assert.NotNil(s.T(), newApp, "new token should resolve after rotation")
+}
+
+func (s *ApplicationSuite) Test_RotateApplicationToken_expectNotFound() {
+	s.db.User(5)
+
+	test.WithUser(s.ctx, 5)
+	s.ctx.Request = httptest.NewRequest("POST", "/application/999/token", nil)
+	s.ctx.Params = gin.Params{{Key: "id", Value: "999"}}
+
+	s.a.RotateApplicationToken(s.ctx)
+
+	assert.Equal(s.T(), 404, s.recorder.Code)
+}
+
+func (s *ApplicationSuite) Test_RotateApplicationToken_expectNotFoundOnCurrentUserIsNotOwner() {
+	s.db.User(5).NewAppWithToken(1, firstApplicationToken)
+	s.db.User(2)
+
+	test.WithUser(s.ctx, 2)
+	s.ctx.Request = httptest.NewRequest("POST", "/application/1/token", nil)
+	s.ctx.Params = gin.Params{{Key: "id", Value: "1"}}
+
+	s.a.RotateApplicationToken(s.ctx)
+
+	assert.Equal(s.T(), 404, s.recorder.Code)
+
+	// Original application should be unchanged
+	app, err := s.db.GetApplicationByID(1)
+	assert.NoError(s.T(), err)
+	assert.Equal(s.T(), firstApplicationToken, app.Token)
+}
+
 func (s *ApplicationSuite) withFormData(formData string) {
 	s.ctx.Request = httptest.NewRequest("POST", "/token", strings.NewReader(formData))
 	s.ctx.Request.Header.Set("Content-Type", "application/x-www-form-urlencoded")

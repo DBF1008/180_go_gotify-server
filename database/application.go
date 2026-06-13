@@ -75,6 +75,21 @@ func (d *GormDatabase) UpdateApplication(app *model.Application) error {
 	return d.DB.Save(app).Error
 }
 
+// UpdateApplicationToken replaces the token of an application identified by id.
+// All other fields (name, description, sort key, image, etc.) are preserved.
+// Returns the updated application.
+func (d *GormDatabase) UpdateApplicationToken(id uint, newToken string) (*model.Application, error) {
+	app := new(model.Application)
+	if err := d.DB.Where("id = ?", id).First(app).Error; err != nil {
+		return nil, err
+	}
+	app.Token = newToken
+	if err := d.DB.Save(app).Error; err != nil {
+		return nil, err
+	}
+	return app, nil
+}
+
 // UpdateApplicationTokenLastUsed updates the last used time of the application token.
 func (d *GormDatabase) UpdateApplicationTokenLastUsed(token string, t *time.Time) error {
 	return d.DB.Model(&model.Application{}).Where("token = ?", token).Update("last_used", t).Error

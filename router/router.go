@@ -231,6 +231,8 @@ func Create(db *database.GormDatabase, vInfo *model.VersionInfo, conf *config.Co
 	{
 		clientElevated.Use(authentication.RequireElevatedClient)
 		clientElevated.POST("/client/:id/elevate", clientHandler.ElevateClient)
+		clientElevated.POST("/client/:id/token", clientHandler.RotateClientToken)
+		clientElevated.POST("/application/:id/token", applicationHandler.RotateApplicationToken)
 		clientElevated.DELETE("/application/:id", applicationHandler.DeleteApplication)
 		clientElevated.DELETE("/client/:id", clientHandler.DeleteClient)
 		clientElevated.POST("/current/user/password", userHandler.ChangePassword)

@@ -198,6 +198,47 @@ func TestDeleteClientShouldCloseConnection(t *testing.T) {
 	user.expectNoMessage()
 }
 
+// TestRotateClientTokenClosesOldConnection verifies that closing connections
+// by old token (as done during token rotation) terminates the old connection
+// while leaving other connections for the same user unaffected.
+func TestRotateClientTokenClosesOldConnection(t *testing.T) {
+	mode.Set(mode.TestDev)
+
+	defer leaktest.CheckTimeout(t, 10*time.Second)()
+	userIDs := []uint{1, 1}
+	tokens := []string{"old-token", "other-token"}
+	i := 0
+	server, api := bootTestServer(func(context *gin.Context) {
+		auth.RegisterClient(context, &model.Client{UserID: userIDs[i], Token: tokens[i]})
+		i++
+	})
+	defer server.Close()
+	defer api.Close()
+
+	wsURL := wsURL(server.URL)
+
+	// Connect with the "old" token
+	oldConn := testClient(t, wsURL)
+	defer oldConn.conn.Close()
+	// Connect with another token for the same user
+	otherConn := testClient(t, wsURL)
+	defer otherConn.conn.Close()
+
+	waitForConnectedClients(api, 2)
+
+	// Both should receive messages
+	api.Notify(1, &model.MessageExternal{ID: 1, Message: "before"})
+	expectMessage(&model.MessageExternal{ID: 1, Message: "before"}, oldConn, otherConn)
+
+	// Simulate token rotation: close connections using the old token
+	api.NotifyDeletedClient(1, "old-token")
+
+	// Old connection should be closed, other connection should still work
+	api.Notify(1, &model.MessageExternal{ID: 2, Message: "after"})
+	oldConn.expectNoMessage()
+	otherConn.expectMessage(&model.MessageExternal{ID: 2, Message: "after"})
+}
+
 func TestDeleteMultipleClients(t *testing.T) {
 	mode.Set(mode.TestDev)
 

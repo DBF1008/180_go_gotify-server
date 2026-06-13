@@ -194,3 +194,52 @@ func (s *DatabaseSuite) TestClientSelectHidesExpired() {
 		assert.Equal(s.T(), valid.Token, cs[0].Token)
 	}
 }
+
+func (s *DatabaseSuite) TestRotateClientToken() {
+	user := &model.User{Name: "rotate_client", Pass: []byte{1}}
+	s.db.CreateUser(user)
+
+	elevatedUntil := now.Add(time.Hour)
+	lastUsed := now.Add(-5 * time.Minute)
+	client := &model.Client{
+		UserID:                        user.ID,
+		Token:                         "COLD_TOKEN",
+		Name:                          "my-client",
+		ExpiresAfterInactivitySeconds: 3600,
+		ElevatedUntil:                 &elevatedUntil,
+		LastUsed:                      &lastUsed,
+	}
+	assert.NoError(s.T(), s.db.CreateClient(client))
+
+	// Rotate the token
+	updated, err := s.db.UpdateClientToken(client.ID, "CNEW_TOKEN")
+	assert.NoError(s.T(), err)
+	assert.NotNil(s.T(), updated)
+
+	// Token should be changed
+	assert.Equal(s.T(), "CNEW_TOKEN", updated.Token)
+	// Name should be preserved
+	assert.Equal(s.T(), "my-client", updated.Name)
+	// Expiry settings should be preserved
+	assert.Equal(s.T(), uint(3600), updated.ExpiresAfterInactivitySeconds)
+	// ElevatedUntil should be cleared
+	assert.Nil(s.T(), updated.ElevatedUntil, "elevated session must be cleared on rotation")
+	// UserID should be preserved
+	assert.Equal(s.T(), user.ID, updated.UserID)
+
+	// Old token should not resolve
+	oldClient, err := s.db.GetClientByToken("COLD_TOKEN")
+	assert.NoError(s.T(), err)
+	assert.Nil(s.T(), oldClient)
+
+	// New token should resolve
+	newClient, err := s.db.GetClientByToken("CNEW_TOKEN")
+	assert.NoError(s.T(), err)
+	assert.NotNil(s.T(), newClient)
+	assert.Equal(s.T(), client.ID, newClient.ID)
+}
+
+func (s *DatabaseSuite) TestRotateClientToken_NonExistent() {
+	_, err := s.db.UpdateClientToken(999, "CNEW_TOKEN")
+	assert.Error(s.T(), err)
+}

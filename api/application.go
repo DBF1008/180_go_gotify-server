@@ -23,6 +23,7 @@ type ApplicationDatabase interface {
 	GetApplicationsByUser(userID uint) ([]*model.Application, error)
 	DeleteApplicationByID(id uint) error
 	UpdateApplication(application *model.Application) error
+	UpdateApplicationToken(id uint, newToken string) (*model.Application, error)
 }
 
 // The ApplicationAPI provides handlers for managing applications.
@@ -439,6 +440,71 @@ func (a *ApplicationAPI) RemoveApplicationImage(ctx *gin.Context) {
 		} else {
 			ctx.AbortWithError(404, fmt.Errorf("app with id %d doesn't exists", id))
 		}
+	})
+}
+
+// RotateApplicationToken generates a new token for an existing application,
+// invalidating the old token immediately. All other configuration (name,
+// description, default priority, sort key, image) is preserved.
+// swagger:operation POST /application/{id}/token application rotateAppToken
+//
+// Rotate an application token.
+//
+// Generates a new token for the application and invalidates the old one.
+// The application's configuration (name, description, default priority, sort key, image) is preserved.
+//
+// Requires elevated authentication.
+//
+//	---
+//	consumes: [application/json]
+//	produces: [application/json]
+//	parameters:
+//	- name: id
+//	  in: path
+//	  description: the application id
+//	  required: true
+//	  type: integer
+//	  format: int64
+//	security: [clientTokenAuthorizationHeader: [], clientTokenHeader: [], clientTokenQuery: [], basicAuth: []]
+//	responses:
+//	  200:
+//	    description: Ok
+//	    schema:
+//	        $ref: "#/definitions/Application"
+//	  400:
+//	    description: Bad Request
+//	    schema:
+//	        $ref: "#/definitions/Error"
+//	  401:
+//	    description: Unauthorized
+//	    schema:
+//	        $ref: "#/definitions/Error"
+//	  403:
+//	    description: Forbidden
+//	    schema:
+//	        $ref: "#/definitions/Error"
+//	  404:
+//	    description: Not Found
+//	    schema:
+//	        $ref: "#/definitions/Error"
+func (a *ApplicationAPI) RotateApplicationToken(ctx *gin.Context) {
+	withID(ctx, "id", func(id uint) {
+		app, err := a.DB.GetApplicationByID(id)
+		if success := successOrAbort(ctx, 500, err); !success {
+			return
+		}
+		if app == nil || app.UserID != auth.GetUserID(ctx) {
+			ctx.AbortWithError(404, fmt.Errorf("app with id %d doesn't exists", id))
+			return
+		}
+
+		newToken := auth.GenerateNotExistingToken(generateApplicationToken, a.applicationExists)
+
+		updated, err := a.DB.UpdateApplicationToken(id, newToken)
+		if success := successOrAbort(ctx, 500, err); !success {
+			return
+		}
+		ctx.JSON(200, withResolvedImage(updated))
 	})
 }
 

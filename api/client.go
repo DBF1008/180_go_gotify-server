@@ -18,6 +18,7 @@ type ClientDatabase interface {
 	GetClientsByUser(userID uint) ([]*model.Client, error)
 	DeleteClientByID(id uint) error
 	UpdateClient(client *model.Client) error
+	UpdateClientToken(id uint, newToken string) (*model.Client, error)
 	UpdateClientElevatedUntil(id uint, t *time.Time) error
 }
 
@@ -319,6 +320,77 @@ func (a *ClientAPI) ElevateClient(ctx *gin.Context) {
 		}
 
 		ctx.Status(204)
+	})
+}
+
+// RotateClientToken generates a new token for an existing client, invalidating
+// the old token immediately. All other configuration (name, expiry settings,
+// sort position) is preserved. Active WebSocket connections using the old
+// token are closed.
+// swagger:operation POST /client/{id}/token client rotateClientToken
+//
+// Rotate a client token.
+//
+// Generates a new token for the client and invalidates the old one.
+// All existing WebSocket connections using the old token are closed.
+// The client's configuration (name, expiry) is preserved.
+//
+// Requires elevated authentication.
+//
+//	---
+//	consumes: [application/json]
+//	produces: [application/json]
+//	parameters:
+//	- name: id
+//	  in: path
+//	  description: the client id
+//	  required: true
+//	  type: integer
+//	  format: int64
+//	security: [clientTokenAuthorizationHeader: [], clientTokenHeader: [], clientTokenQuery: [], basicAuth: []]
+//	responses:
+//	  200:
+//	    description: Ok
+//	    schema:
+//	        $ref: "#/definitions/Client"
+//	  400:
+//	    description: Bad Request
+//	    schema:
+//	        $ref: "#/definitions/Error"
+//	  401:
+//	    description: Unauthorized
+//	    schema:
+//	        $ref: "#/definitions/Error"
+//	  403:
+//	    description: Forbidden
+//	    schema:
+//	        $ref: "#/definitions/Error"
+//	  404:
+//	    description: Not Found
+//	    schema:
+//	        $ref: "#/definitions/Error"
+func (a *ClientAPI) RotateClientToken(ctx *gin.Context) {
+	withID(ctx, "id", func(id uint) {
+		client, err := a.DB.GetClientByID(id)
+		if success := successOrAbort(ctx, 500, err); !success {
+			return
+		}
+		if client == nil || client.UserID != auth.GetUserID(ctx) {
+			ctx.AbortWithError(404, fmt.Errorf("client with id %d doesn't exists", id))
+			return
+		}
+
+		oldToken := client.Token
+		newToken := auth.GenerateNotExistingToken(generateClientToken, a.clientExists)
+
+		// Close all active WebSocket connections using the old token.
+		a.NotifyDeleted(client.UserID, oldToken)
+
+		updated, err := a.DB.UpdateClientToken(id, newToken)
+		if success := successOrAbort(ctx, 500, err); !success {
+			return
+		}
+		ctx.JSON(200, updated)
 	})
 }
 

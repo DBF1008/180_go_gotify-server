@@ -99,3 +99,53 @@ func (s *DatabaseSuite) TestDeleteAppDeletesMessages() {
 		assert.NotEmpty(s.T(), msgs)
 	}
 }
+
+func (s *DatabaseSuite) TestRotateApplicationToken() {
+	user := &model.User{Name: "rotate_app", Pass: []byte{1}}
+	s.db.CreateUser(user)
+
+	lastUsed := now.Add(-5 * time.Minute)
+	app := &model.Application{
+		UserID:          user.ID,
+		Token:           "AOLD_TOKEN",
+		Name:            "my-app",
+		Description:     "my description",
+		DefaultPriority: 5,
+		SortKey:         "a3",
+		Image:           "custom.png",
+		LastUsed:        &lastUsed,
+	}
+	assert.NoError(s.T(), s.db.CreateApplication(app))
+
+	// Rotate the token
+	updated, err := s.db.UpdateApplicationToken(app.ID, "ANEW_TOKEN")
+	assert.NoError(s.T(), err)
+	assert.NotNil(s.T(), updated)
+
+	// Token should be changed
+	assert.Equal(s.T(), "ANEW_TOKEN", updated.Token)
+	// All configuration should be preserved
+	assert.Equal(s.T(), "my-app", updated.Name)
+	assert.Equal(s.T(), "my description", updated.Description)
+	assert.Equal(s.T(), 5, updated.DefaultPriority)
+	assert.Equal(s.T(), "a3", updated.SortKey)
+	assert.Equal(s.T(), "custom.png", updated.Image)
+	// UserID should be preserved
+	assert.Equal(s.T(), user.ID, updated.UserID)
+
+	// Old token should not resolve
+	oldApp, err := s.db.GetApplicationByToken("AOLD_TOKEN")
+	assert.NoError(s.T(), err)
+	assert.Nil(s.T(), oldApp)
+
+	// New token should resolve
+	newApp, err := s.db.GetApplicationByToken("ANEW_TOKEN")
+	assert.NoError(s.T(), err)
+	assert.NotNil(s.T(), newApp)
+	assert.Equal(s.T(), app.ID, newApp.ID)
+}
+
+func (s *DatabaseSuite) TestRotateApplicationToken_NonExistent() {
+	_, err := s.db.UpdateApplicationToken(999, "ANEW_TOKEN")
+	assert.Error(s.T(), err)
+}

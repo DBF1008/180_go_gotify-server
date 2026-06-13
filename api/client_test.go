@@ -323,6 +323,138 @@ func (s *ClientSuite) Test_ElevateClient_expectBadRequestOnMissingDuration() {
 	assert.Nil(s.T(), client.ElevatedUntil)
 }
 
+func (s *ClientSuite) Test_RotateClientToken_expectSuccess() {
+	s.db.User(5).NewClientWithToken(1, firstClientToken)
+
+	test.WithUser(s.ctx, 5)
+	s.ctx.Request = httptest.NewRequest("POST", "/client/1/token", nil)
+	s.ctx.Params = gin.Params{{Key: "id", Value: "1"}}
+
+	s.a.RotateClientToken(s.ctx)
+
+	assert.Equal(s.T(), 200, s.recorder.Code)
+
+	client, err := s.db.GetClientByID(1)
+	assert.NoError(s.T(), err)
+	assert.NotNil(s.T(), client)
+	// Token should have changed from the original
+	assert.NotEqual(s.T(), firstClientToken, client.Token)
+	// Name and other config should be preserved
+	assert.Equal(s.T(), uint(5), client.UserID)
+}
+
+func (s *ClientSuite) Test_RotateClientToken_preservesConfiguration() {
+	s.db.User(5)
+	client := s.db.User(5).NewClientWithToken(1, firstClientToken)
+	client.Name = "my-important-client"
+	client.ExpiresAfterInactivitySeconds = 3600
+	assert.NoError(s.T(), s.db.UpdateClient(client))
+
+	test.WithUser(s.ctx, 5)
+	s.ctx.Request = httptest.NewRequest("POST", "/client/1/token", nil)
+	s.ctx.Params = gin.Params{{Key: "id", Value: "1"}}
+
+	s.a.RotateClientToken(s.ctx)
+
+	assert.Equal(s.T(), 200, s.recorder.Code)
+
+	updated, err := s.db.GetClientByID(1)
+	assert.NoError(s.T(), err)
+	assert.NotNil(s.T(), updated)
+	assert.NotEqual(s.T(), firstClientToken, updated.Token)
+	assert.Equal(s.T(), "my-important-client", updated.Name)
+	assert.Equal(s.T(), uint(3600), updated.ExpiresAfterInactivitySeconds)
+}
+
+func (s *ClientSuite) Test_RotateClientToken_oldTokenNoLongerValid() {
+	s.db.User(5).NewClientWithToken(1, firstClientToken)
+
+	test.WithUser(s.ctx, 5)
+	s.ctx.Request = httptest.NewRequest("POST", "/client/1/token", nil)
+	s.ctx.Params = gin.Params{{Key: "id", Value: "1"}}
+
+	s.a.RotateClientToken(s.ctx)
+
+	assert.Equal(s.T(), 200, s.recorder.Code)
+
+	// Old token should no longer resolve to a client
+	oldClient, err := s.db.GetClientByToken(firstClientToken)
+	assert.NoError(s.T(), err)
+	assert.Nil(s.T(), oldClient, "old token should not resolve after rotation")
+
+	// New token should resolve
+	updated, err := s.db.GetClientByID(1)
+	assert.NoError(s.T(), err)
+	newClient, err := s.db.GetClientByToken(updated.Token)
+	assert.NoError(s.T(), err)
+	assert.NotNil(s.T(), newClient, "new token should resolve after rotation")
+}
+
+func (s *ClientSuite) Test_RotateClientToken_closesWebSocketConnections() {
+	s.db.User(5).NewClientWithToken(1, firstClientToken)
+
+	test.WithUser(s.ctx, 5)
+	s.ctx.Request = httptest.NewRequest("POST", "/client/1/token", nil)
+	s.ctx.Params = gin.Params{{Key: "id", Value: "1"}}
+
+	assert.False(s.T(), s.notified, "NotifyDeleted should not have been called yet")
+
+	s.a.RotateClientToken(s.ctx)
+
+	assert.Equal(s.T(), 200, s.recorder.Code)
+	assert.True(s.T(), s.notified, "NotifyDeleted should be called to close old WebSocket connections")
+}
+
+func (s *ClientSuite) Test_RotateClientToken_expectNotFound() {
+	s.db.User(5)
+
+	test.WithUser(s.ctx, 5)
+	s.ctx.Request = httptest.NewRequest("POST", "/client/999/token", nil)
+	s.ctx.Params = gin.Params{{Key: "id", Value: "999"}}
+
+	s.a.RotateClientToken(s.ctx)
+
+	assert.Equal(s.T(), 404, s.recorder.Code)
+}
+
+func (s *ClientSuite) Test_RotateClientToken_expectNotFoundOnCurrentUserIsNotOwner() {
+	s.db.User(5).NewClientWithToken(1, firstClientToken)
+	s.db.User(2)
+
+	test.WithUser(s.ctx, 2)
+	s.ctx.Request = httptest.NewRequest("POST", "/client/1/token", nil)
+	s.ctx.Params = gin.Params{{Key: "id", Value: "1"}}
+
+	s.a.RotateClientToken(s.ctx)
+
+	assert.Equal(s.T(), 404, s.recorder.Code)
+
+	// Original client should be unchanged
+	client, err := s.db.GetClientByID(1)
+	assert.NoError(s.T(), err)
+	assert.Equal(s.T(), firstClientToken, client.Token)
+}
+
+func (s *ClientSuite) Test_RotateClientToken_clearsElevatedUntil() {
+	s.db.User(5)
+	client := s.db.User(5).NewClientWithToken(1, firstClientToken)
+	elevatedUntil := time.Now().Add(1 * time.Hour)
+	client.ElevatedUntil = &elevatedUntil
+	assert.NoError(s.T(), s.db.UpdateClient(client))
+
+	test.WithUser(s.ctx, 5)
+	s.ctx.Request = httptest.NewRequest("POST", "/client/1/token", nil)
+	s.ctx.Params = gin.Params{{Key: "id", Value: "1"}}
+
+	s.a.RotateClientToken(s.ctx)
+
+	assert.Equal(s.T(), 200, s.recorder.Code)
+
+	updated, err := s.db.GetClientByID(1)
+	assert.NoError(s.T(), err)
+	assert.Nil(s.T(), updated.ElevatedUntil, "elevated session should be cleared on token rotation")
+}
+
 func (s *ClientSuite) withFormData(formData string) {
 	s.ctx.Request = httptest.NewRequest("POST", "/token", strings.NewReader(formData))
 	s.ctx.Request.Header.Set("Content-Type", "application/x-www-form-urlencoded")
